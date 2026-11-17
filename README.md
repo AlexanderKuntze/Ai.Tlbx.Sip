@@ -113,7 +113,7 @@ await call.ResumeAsync(); // re-INVITE offering sendrecv
 
 In-dialog re-INVITE (RFC 3261 section 14.2) and UPDATE (RFC 3311) from the PBX are accepted and answered with the RFC 3264 complementary direction (`sendrecv`, `sendonly`, `recvonly`, `inactive`, including the legacy `0.0.0.0` hold). `call.RemoteMediaDirection` reports what the remote side declared, `call.Audio.Direction` the negotiated local direction; no RTP is sent while the local direction does not include sending. A rejected own re-INVITE leaves the session unchanged and throws `SipException`; `491` is retried after a random delay, and `408`/`481` end the dialog with BYE.
 
-Some PBXs hold and resume without any signalling to this leg and only switch the RTP source. The receiver follows a new remote SSRC once the current one has been silent for 200 ms and reports the switch as a `media` diagnostic. SRTP receive state is kept per SSRC (RFC 3711 section 3.2.3).
+Some PBXs hold and resume without any signalling to this leg and only switch the RTP source. The receiver follows a new remote SSRC once the current one has been silent for 200 ms and reports the switch as a `media` diagnostic. SRTP receive state is kept per SSRC (RFC 3711 section 3.2.3). Replay windows are retained for the key lifetime, with at most 256 remote SSRCs per key; further unknown streams are rejected until a new key is negotiated. Existing streams keep working at the limit.
 
 ### Caller identity
 
@@ -147,7 +147,7 @@ if (joined.Outcome != SipTransferOutcome.Succeeded)
 }
 ```
 
-Both send REFER (RFC 3515); attended transfer adds a `Replaces` header for the consultation dialog (RFC 3891, RFC 5589 section 7). The result reports the native SIP status from the REFER response or the final `message/sipfrag` NOTIFY. On success this side sends BYE and the call ends as `Transferred`; on failure the calls stay as they are and the application decides how to continue. See `docs/changes/transfer-refer.md`.
+Both send REFER (RFC 3515); attended transfer adds a `Replaces` header for the consultation dialog (RFC 3891, RFC 5589 section 7). The result reports the native SIP status from the REFER response or the final `message/sipfrag` NOTIFY. On success this side sends BYE and the call ends as `Transferred`; on failure the calls stay as they are and the application decides how to continue. Transfer NOTIFY subscriptions are matched by the REFER CSeq in `Event: refer;id=...` (RFC 3515 section 2.4.6), including authentication retries. An omitted ID is accepted only for the first transfer in a dialog; ambiguous later notifications cannot complete a new transfer. See `docs/changes/transfer-refer.md`.
 
 Concurrent `HangupAsync` callers share teardown. Cancelling a hangup wait does not abandon the call's protocol cleanup. If an incoming answer never receives ACK, the transaction timeout ends the call and releases hangup waiters.
 

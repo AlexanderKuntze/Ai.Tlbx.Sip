@@ -9,6 +9,53 @@ using Ai.Tlbx.VoiceAssistant.Sip;
 
 var cases = new (string Name, Func<Task> Run)[]
 {
+    ("SRTP stream limit preserves replay windows and accepts existing streams", () =>
+    {
+        byte[] master = Enumerable.Range(0, 30).Select(x => (byte)x).ToArray();
+        using var rx = new SrtpContext(master);
+        byte[]? first = null;
+        for (uint ssrc = 1; ssrc <= SrtpContext.MaxReceiveStreams + 1; ssrc++)
+        {
+            using var tx = new SrtpContext(master);
+            byte[] packet = Check.Rtp(1, 160, [1, 2, 3, 4]);
+            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(8), ssrc);
+            byte[] encrypted = tx.Protect(packet, 12); first ??= encrypted;
+            Check.That((rx.Unprotect(encrypted, 12) is not null) == (ssrc <= SrtpContext.MaxReceiveStreams));
+        }
+        Check.That(rx.Unprotect(first!, 12) is null, "Never reopen an evicted replay window");
+        using var original = new SrtpContext(master);
+        byte[] next = Check.Rtp(2, 320, [5, 6, 7, 8]);
+        BinaryPrimitives.WriteUInt32BigEndian(next.AsSpan(8), 1);
+        Check.That(rx.Unprotect(original.Protect(next, 12), 12) is not null, "Existing streams keep working at capacity");
+        return Task.CompletedTask;
+    }),
+    ("Transfer retries ignore old NOTIFY subscriptions, including after authentication", async () =>
+    {
+        await using var pbx = new TestPbx { ChallengeRefer = true, NotifyBeforeReferResponse = true };
+        await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var call = client.CreateCall("123"); await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        pbx.TransferFinalCode = 486; pbx.OmitReferEventId = true;
+        Check.That((await call.TransferAsync("50")).Outcome == SipTransferOutcome.Failed);
+        pbx.TransferFinalCode = 200; pbx.OmitReferEventId = false; pbx.InjectStaleReferNotify = true;
+        var second = await call.TransferAsync("51").WaitAsync(TimeSpan.FromSeconds(5));
+        Check.That(second.Outcome == SipTransferOutcome.Succeeded, "A stale first subscription must not complete the second: " + second);
+        await client.DisconnectAsync();
+    }),
+    ("Unidentified later transfer NOTIFY cannot end the wrong call", async () =>
+    {
+        await using var pbx = new TestPbx { OmitReferEventId = true, TransferFinalCode = 486 };
+        await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port, answerTimeout: TimeSpan.FromMilliseconds(100), transactionTimeout: TimeSpan.FromMilliseconds(300)));
+        await client.ConnectAsync();
+        var call = client.CreateCall("123"); await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Check.That((await call.TransferAsync("50")).Outcome == SipTransferOutcome.Failed);
+        pbx.TransferFinalCode = 200;
+        var second = await call.TransferAsync("51").WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(second.Outcome == SipTransferOutcome.Unknown && call.Status.State == SipCallState.Established);
+        await call.HangupAsync(); await client.DisconnectAsync();
+    }),
+
     ("SIP framing, UTF-8, compact and repeated headers", () =>
     {
         var m = new SipMessage { StartLine = "MESSAGE sip:x@example.test SIP/2.0", Body = Encoding.UTF8.GetBytes("Grüße") };

@@ -10,9 +10,10 @@ internal sealed class SrtpContext : IDisposable
     private long _highest = -1;
     // RFC 3711 section 3.2.3: rollover counter and replay list belong to each SSRC. A PBX switches the
     // media source after hold, resume or transfer; one shared receive state would reject the new stream.
-    private const int MaxReceiveStreams = 8;
-    private readonly Dictionary<uint, (long Highest, ulong Replay, long LastUse)> _receive = [];
-    private long _receiveUse;
+    // Keep replay windows for the whole key lifetime. Evicting one would let captured packets
+    // recreate that stream and pass authentication again. Refuse new streams at the bounded limit.
+    internal const int MaxReceiveStreams = 256;
+    private readonly Dictionary<uint, (long Highest, ulong Replay)> _receive = [];
     public SrtpContext(ReadOnlySpan<byte> master, bool control = false)
     {
         if (master.Length != 30) throw new ArgumentException("SRTP requires a 16-byte key and 14-byte salt.");
@@ -77,7 +78,9 @@ internal sealed class SrtpContext : IDisposable
         if (packet.Length < headerLength + 10) return null;
         ushort sequence = BinaryPrimitives.ReadUInt16BigEndian(packet[2..]);
         uint ssrc = BinaryPrimitives.ReadUInt32BigEndian(packet[8..]);
-        var (highest, replay, _) = _receive.TryGetValue(ssrc, out var state) ? state : (-1L, 0UL, 0L);
+        bool known = _receive.TryGetValue(ssrc, out var state);
+        if (!known && _receive.Count >= MaxReceiveStreams) return null;
+        var (highest, replay) = known ? state : (-1L, 0UL);
         long index = Estimate(sequence, highest), distance = highest - index;
         if (index < 0 || distance >= 64 || (distance >= 0 && (replay & (1UL << (int)distance)) != 0)) return null;
         int length = packet.Length - 10;
@@ -94,9 +97,7 @@ internal sealed class SrtpContext : IDisposable
             highest = index;
         }
         else replay |= 1UL << (int)distance;
-        if (!_receive.ContainsKey(ssrc) && _receive.Count >= MaxReceiveStreams)
-            _receive.Remove(_receive.MinBy(s => s.Value.LastUse).Key);
-        _receive[ssrc] = (highest, replay, ++_receiveUse);
+        _receive[ssrc] = (highest, replay);
         return result;
     }
     public void Dispose()

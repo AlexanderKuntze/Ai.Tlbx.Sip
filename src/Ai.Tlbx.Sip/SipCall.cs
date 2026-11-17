@@ -32,6 +32,8 @@ public sealed class SipCall : IAsyncDisposable
     private int _lastRefreshSequence = -1;
     private SipMessage? _lastRefreshAck;
     private TaskCompletionSource<(int Code, string Phrase)>? _transferResult;
+    private SipMessage? _transferRequest;
+    private bool _hasSentRefer, _transferAllowsMissingId;
     private SipPartyIdentity _remoteIdentity;
     /// <summary>RFC 3261 section 14.1: after 491 Request Pending the re-INVITE is retried after a random 2.1 to 4 seconds.</summary>
     internal static TimeSpan GlareRetryMinimum = TimeSpan.FromMilliseconds(2100), GlareRetryMaximum = TimeSpan.FromMilliseconds(4000);
@@ -511,7 +513,9 @@ public sealed class SipCall : IAsyncDisposable
             {
                 if (Status.State != SipCallState.Established || _ending) throw new InvalidOperationException("Only an established call can be transferred.");
                 result = _transferResult = new(TaskCreationOptions.RunContinuationsAsynchronously);
-                request = DialogRequest("REFER");
+                request = _transferRequest = DialogRequest("REFER");
+                _transferAllowsMissingId = !_hasSentRefer;
+                _hasSentRefer = true;
                 request.Add("Refer-To", "<" + targetUri + ">");
                 request.Add("Referred-By", $"<sip:{Uri.EscapeDataString(_client.Config.User)}@{_client.Config.SipDomain}>");
             }
@@ -559,7 +563,11 @@ public sealed class SipCall : IAsyncDisposable
                 }
                 return new(SipTransferOutcome.Succeeded, final.Code, final.Phrase);
             }
-            finally { lock (_gate) if (ReferenceEquals(_transferResult, result)) _transferResult = null; }
+            finally
+            {
+                lock (_gate) if (ReferenceEquals(_transferResult, result))
+                { _transferResult = null; _transferRequest = null; }
+            }
         }
         finally { _renegotiation.Release(); }
     }
@@ -582,6 +590,21 @@ public sealed class SipCall : IAsyncDisposable
         string eventPackage = request.Get("Event").Split(';')[0].Trim();
         if (!eventPackage.Equals("refer", StringComparison.OrdinalIgnoreCase))
         { await _client.ReplyAsync(request, SipMessage.Response(request, 489, "Bad Event", _localTag)); return; }
+        // RFC 3515 section 2.4.6: only the first REFER can omit Event's id. Later
+        // subscriptions use the REFER CSeq, including a changed CSeq after authentication.
+        TaskCompletionSource<(int Code, string Phrase)>? pending;
+        string id = SipMessage.Parameter(request.Get("Event"), "id");
+        lock (_gate)
+        {
+            pending = _transferRequest is not null &&
+                (id.Length == 0 ? _transferAllowsMissingId :
+                    id == _transferRequest.CSeqNumber.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                ? _transferResult : null;
+        }
+        if (pending is null)
+        { await _client.ReplyAsync(request, SipMessage.Response(request, 481, "Subscription Does Not Exist", _localTag)); return; }
+        if (!request.Get("Content-Type").Split(';')[0].Trim().Equals("message/sipfrag", StringComparison.OrdinalIgnoreCase))
+        { await _client.ReplyAsync(request, SipMessage.Response(request, 415, "Unsupported Media Type", _localTag)); return; }
         await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK", _localTag));
         int code = 0; string phrase = "";
         string fragment = Encoding.UTF8.GetString(request.Body).Split('\n')[0].Trim();
@@ -590,10 +613,7 @@ public sealed class SipCall : IAsyncDisposable
             int.TryParse(parts[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int parsed))
         { code = parsed; phrase = parts.Length > 2 ? parts[2] : ""; }
         bool terminated = request.Get("Subscription-State").TrimStart().StartsWith("terminated", StringComparison.OrdinalIgnoreCase);
-        TaskCompletionSource<(int Code, string Phrase)>? pending;
-        lock (_gate) pending = _transferResult;
-        if (pending is null) return;
-        if (code >= 200) pending.TrySetResult((code, phrase));
+        if (code is >= 200 and <= 699) pending.TrySetResult((code, phrase));
         else if (terminated) pending.TrySetResult((0, "The PBX ended the transfer subscription without a final result."));
     }
     private async Task TerminateDialogAsync(string reason)

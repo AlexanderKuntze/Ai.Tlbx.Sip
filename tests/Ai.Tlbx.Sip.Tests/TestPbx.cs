@@ -37,6 +37,10 @@ internal sealed class TestPbx : IAsyncDisposable
     public volatile bool DropRegistrationResponses;
     public int AckRequests { get; private set; }
     public SipMessage? LastRefer { get; private set; }
+    public bool InjectStaleReferNotify { get; set; }
+    public bool OmitReferEventId { get; set; }
+    public bool NotifyBeforeReferResponse { get; set; }
+    public bool ChallengeRefer { get; set; }
     public int RejectReferWith { get; set; }
     public int TransferFinalCode { get; set; } = 200;
     public bool EndReplacedDialog { get; set; } = true;
@@ -47,7 +51,8 @@ internal sealed class TestPbx : IAsyncDisposable
         var notify = new SipMessage { StartLine = $"NOTIFY {SipMessage.UriFromHeader(refer.Get("Contact"))} SIP/2.0" };
         notify.Add("Via", $"SIP/2.0/UDP 127.0.0.1:{Port};branch=z9hG4bK{Guid.NewGuid():N}");
         notify.Add("From", refer.Get("To")); notify.Add("To", refer.Get("From")); notify.Add("Call-ID", refer.Get("Call-ID"));
-        notify.Add("CSeq", $"{++_notifySequence} NOTIFY"); notify.Add("Event", "refer"); notify.Add("Subscription-State", state);
+        notify.Add("CSeq", $"{++_notifySequence} NOTIFY");
+        notify.Add("Event", OmitReferEventId ? "refer" : "refer;id=" + refer.CSeqNumber); notify.Add("Subscription-State", state);
         notify.Add("Content-Type", "message/sipfrag"); notify.Body = Encoding.UTF8.GetBytes(fragment + "\r\n");
         return notify;
     }
@@ -103,11 +108,24 @@ internal sealed class TestPbx : IAsyncDisposable
                 else if (request.Method == "REFER")
                 {
                     // RFC 3515: accept, then report the target's progress and result as message/sipfrag NOTIFYs.
-                    LastRefer = request;
+                    if (ChallengeRefer && request.Get("Authorization").Length == 0)
+                    {
+                        var challenge = SipMessage.Response(request, 401, "Unauthorized");
+                        challenge.Add("WWW-Authenticate", "Digest realm=\"test-realm\", nonce=\"refer-nonce\", algorithm=SHA-256, qop=\"auth\"");
+                        await SendAsync(challenge); continue;
+                    }
+                    var previousRefer = LastRefer; LastRefer = request;
                     if (RejectReferWith > 0) { await SendAsync(SipMessage.Response(request, RejectReferWith, "Forbidden")); continue; }
-                    await SendAsync(SipMessage.Response(request, 202, "Accepted"));
+                    if (!NotifyBeforeReferResponse) await SendAsync(SipMessage.Response(request, 202, "Accepted"));
+                    if (InjectStaleReferNotify && previousRefer is not null)
+                    {
+                        var stale = ReferNotify(previousRefer, "SIP/2.0 486 Busy Here", "terminated;reason=noresource");
+                        stale.Set("Event", "refer;id=" + previousRefer.CSeqNumber);
+                        await SendAsync(stale);
+                    }
                     await SendAsync(ReferNotify(request, "SIP/2.0 100 Trying", "active;expires=60"));
                     await SendAsync(ReferNotify(request, $"SIP/2.0 {TransferFinalCode} {(TransferFinalCode == 200 ? "OK" : "Busy Here")}", "terminated;reason=noresource"));
+                    if (NotifyBeforeReferResponse) await SendAsync(SipMessage.Response(request, 202, "Accepted"));
                     // RFC 3891: a successful INVITE with Replaces ends the replaced dialog; the PBX sends its BYE.
                     string referTo = Uri.UnescapeDataString(request.Get("Refer-To"));
                     int replaces = referTo.IndexOf("?Replaces=", StringComparison.Ordinal);
