@@ -22,19 +22,85 @@ public sealed class SipCall : IAsyncDisposable
     private Task? _hangupTask;
     private bool _ending;
     private readonly Dictionary<string, Task> _closingDialogs = [];
+    // RFC 3264 section 8: one SDP origin per call; the version increases with every new description.
+    private long _sdpId, _sdpVersion;
+    private SipMediaDirection _localDirection = SipMediaDirection.SendReceive;
+    private SipMediaDirection _remoteDirection = SipMediaDirection.SendReceive;
+    private (int Sequence, TaskCompletionSource<SipMessage> Ack, bool OfferInAck)? _pendingRefresh;
+    private readonly SemaphoreSlim _renegotiation = new(1, 1);
+    private bool _outgoingRefresh;
+    private int _lastRefreshSequence = -1;
+    private SipMessage? _lastRefreshAck;
+    private TaskCompletionSource<(int Code, string Phrase)>? _transferResult;
+    private SipPartyIdentity _remoteIdentity;
+    /// <summary>RFC 3261 section 14.1: after 491 Request Pending the re-INVITE is retried after a random 2.1 to 4 seconds.</summary>
+    internal static TimeSpan GlareRetryMinimum = TimeSpan.FromMilliseconds(2100), GlareRetryMaximum = TimeSpan.FromMilliseconds(4000);
     private SipCall(SipClient client, string id, SipCallDirection direction, string remote)
     {
         _client = client; Id = id; Direction = direction; _remoteTarget = remote; _remoteHeader = "<" + remote + ">";
         _status = new(direction == SipCallDirection.Incoming ? SipCallState.Incoming : SipCallState.Created, client.Time.GetUtcNow());
+        _remoteIdentity = SipPartyIdentity.Parse("<" + remote + ">") ?? new(remote, null, null, false);
         Audio = new(client.Config, client.Time, client.MediaAddress, error => client.Report("media", error));
     }
     public string Id { get; }
     public SipCallDirection Direction { get; }
     public string RemoteUri => SipMessage.UriFromHeader(_remoteHeader);
+    /// <summary>
+    /// The remote party: for incoming calls the caller, preferring the PBX-asserted identity
+    /// (P-Asserted-Identity, RFC 3325; then Remote-Party-ID) over the From header; for outgoing calls the
+    /// called party, updated from P-Asserted-Identity or To of the answer.
+    /// </summary>
+    public SipPartyIdentity RemoteIdentity { get { lock (_gate) return _remoteIdentity; } }
+    /// <summary>
+    /// Incoming calls: the number originally dialled, before any forwarding. Taken from the oldest Diversion
+    /// entry (RFC 5806), else the first History-Info entry (RFC 7044), else the To header. Null for outgoing calls.
+    /// </summary>
+    public SipPartyIdentity? CalledIdentity { get; private set; }
+    /// <summary>Incoming calls: forwarding steps from Diversion, most recent first (RFC 5806). Empty if the call was not forwarded or the PBX does not signal it.</summary>
+    public IReadOnlyList<SipPartyIdentity> Diversions { get; private set; } = [];
+    /// <summary>Incoming calls: the headers of the initial INVITE in received order, without authorization headers, for PBX-specific information.</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> InitialHeaders { get; private set; } = [];
+    private static SipPartyIdentity? FirstIdentity(IEnumerable<string> headerValues)
+    {
+        var parties = headerValues.SelectMany(SipPartyIdentity.SplitEntries).Select(SipPartyIdentity.Parse).OfType<SipPartyIdentity>().ToList();
+        // RFC 3325 allows one sip: and one tel: identity; prefer an entry that carries a number.
+        return parties.FirstOrDefault(p => p.Number is not null || p.Anonymous) ?? parties.FirstOrDefault();
+    }
+    private static SipPartyIdentity? OriginalCalled(SipMessage invite, IReadOnlyList<SipPartyIdentity> diversions, string ownUser)
+    {
+        if (diversions.Count > 0) return diversions[^1];
+        var history = invite.GetAll("History-Info").SelectMany(SipPartyIdentity.SplitEntries)
+            .Select(e => (Key: SipPartyIdentity.IndexKey(SipPartyIdentity.HeaderParameter(e, "index") is { Length: > 0 } i ? i : "999"), Party: SipPartyIdentity.Parse(e)))
+            .Where(e => e.Party is not null).ToList();
+        if (history.Count > 0)
+        {
+            history.Sort((a, b) => SipPartyIdentity.CompareIndex(a.Key, b.Key));
+            return history[0].Party;
+        }
+        // Many PBXs address the endpoint by its own registration (for example its account name) and send the
+        // dialled number nowhere else; that is not the dialled number, so report it as unknown.
+        var to = SipPartyIdentity.Parse(invite.Get("To")) ?? SipPartyIdentity.Parse("<" + invite.RequestUri + ">");
+        return to is null || string.Equals(to.Number, ownUser, StringComparison.OrdinalIgnoreCase) ? null : to;
+    }
     public SipCallStatus Status => Volatile.Read(ref _status);
     public SipCallAudio Audio { get; }
     public SipMediaMetrics Metrics => Audio.Metrics;
     public Task<SipCallStatus> Completion => _completion.Task;
+    /// <summary>Direction the remote side last declared in its SDP. SendOnly or Inactive means the remote side holds the call.</summary>
+    public SipMediaDirection RemoteMediaDirection { get { lock (_gate) return _remoteDirection; } }
+    /// <summary>Raised after a re-INVITE or UPDATE changed the session, for example when the PBX holds or resumes the call.</summary>
+    public event EventHandler<SipMediaDirection>? MediaChanged;
+    /// <summary>True while this side holds the call (it offered sendonly or inactive).</summary>
+    public bool IsOnHold { get { lock (_gate) return _localDirection is SipMediaDirection.SendOnly or SipMediaDirection.Inactive; } }
+    /// <summary>
+    /// Holds the call with a re-INVITE that offers <c>sendonly</c> (RFC 3264 section 8.4, RFC 6337 section 5.3).
+    /// The remote party stops sending, while this side may still play hold music or announcements through
+    /// <see cref="Audio"/>. Completes after the remote answer is applied; if the remote side rejects the
+    /// re-INVITE the call continues unchanged and a <see cref="SipException"/> carries the SIP status.
+    /// </summary>
+    public Task HoldAsync(CancellationToken cancellationToken = default) => RenegotiateAsync(SipMediaDirection.SendOnly, cancellationToken);
+    /// <summary>Resumes a held call with a re-INVITE that offers <c>sendrecv</c>.</summary>
+    public Task ResumeAsync(CancellationToken cancellationToken = default) => RenegotiateAsync(SipMediaDirection.SendReceive, cancellationToken);
     public event EventHandler<SipCallStatus>? StatusChanged;
     public event EventHandler<SipCallStatus>? Ended;
     internal static SipCall Outgoing(SipClient client, string uri) => new(client, SipClient.NewId(), SipCallDirection.Outgoing, uri);
@@ -44,6 +110,12 @@ public sealed class SipCall : IAsyncDisposable
         call._invite = invite; call._remoteHeader = invite.Get("From");
         call._localHeader = invite.Get("To") + ";tag=" + call._localTag;
         call._routes = invite.GetAll("Record-Route").ToArray(); call._remoteSequence = invite.CSeqNumber;
+        call._remoteIdentity = FirstIdentity(invite.GetAll("P-Asserted-Identity")) ?? FirstIdentity(invite.GetAll("Remote-Party-ID")) ??
+            SipPartyIdentity.Parse(invite.Get("From")) ?? call._remoteIdentity;
+        call.Diversions = invite.GetAll("Diversion").SelectMany(SipPartyIdentity.SplitEntries).Select(SipPartyIdentity.Parse).OfType<SipPartyIdentity>().ToArray();
+        call.CalledIdentity = OriginalCalled(invite, call.Diversions, client.Config.User);
+        call.InitialHeaders = invite.Headers.Where(h => !h.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase) &&
+            !h.Key.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase)).ToArray();
         return call;
     }
     internal async Task RingAsync()
@@ -68,7 +140,7 @@ public sealed class SipCall : IAsyncDisposable
             _invite = _client.Request("INVITE", _remoteTarget, Id, _localTag, _remoteHeader);
             _localHeader = _invite.Get("From");
             _invite.Add("Content-Type", "application/sdp");
-            _invite.Body = Encoding.UTF8.GetBytes(SdpSession.Offer(_client.MediaAddress, Audio.Port, Audio.MasterKey, _client.Time.GetUtcNow().ToUnixTimeMilliseconds()));
+            _invite.Body = Encoding.UTF8.GetBytes(SdpSession.Offer(_client.MediaAddress, Audio.Port, Audio.MasterKey, NewSdpOrigin(), version: _sdpVersion));
             var response = await _client.RequestAuthenticatedAsync(_invite, p =>
             {
                 if (p.StatusCode >= 200) _lastResponse = p;
@@ -91,13 +163,20 @@ public sealed class SipCall : IAsyncDisposable
             }
             SetRemoteDialog(response);
             await AckAsync(response);
+            var answered = FirstIdentity(response.GetAll("P-Asserted-Identity")) ?? SipPartyIdentity.Parse(response.Get("To"));
+            if (answered is not null) lock (_gate) _remoteIdentity = answered;
             var session = SdpSession.Parse(response.Body, _client.Config.MediaSecurity);
             bool cancel;
             lock (_gate)
             {
                 if (Status.State == SipCallState.Ended) return;
                 cancel = _ending || linked.IsCancellationRequested;
-                if (!cancel) { Audio.Start(session); SetStatus(SipCallState.Established, response.StatusCode, phrase: response.ReasonPhrase); }
+                if (!cancel)
+                {
+                    _remoteDirection = session.Direction;
+                    Audio.Start(session, SdpSession.AnswerDirection(session, _localDirection));
+                    SetStatus(SipCallState.Established, response.StatusCode, phrase: response.ReasonPhrase);
+                }
             }
             if (cancel)
             {
@@ -135,7 +214,7 @@ public sealed class SipCall : IAsyncDisposable
             _answer = SipMessage.Response(_invite, 200, "OK", _localTag);
             _answer.Add("Contact", _client.Contact); _answer.Add("Content-Type", "application/sdp");
             _answer.Body = Encoding.UTF8.GetBytes(SdpSession.Answer(_client.MediaAddress, Audio.Port, Audio.MasterKey,
-                _client.Time.GetUtcNow().ToUnixTimeMilliseconds(), remote));
+                NewSdpOrigin(), remote, _localDirection, _sdpVersion));
             using var deadline = new CancellationTokenSource(_client.Config.TransactionTimeout, _client.Time);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken, _stop.Token);
             TimeSpan interval = _client.Config.InitialRetransmitInterval;
@@ -153,7 +232,8 @@ public sealed class SipCall : IAsyncDisposable
             lock (_gate)
             {
                 if (_stop.IsCancellationRequested || _ending) return;
-                Audio.Start(remote); SetStatus(SipCallState.Established, 200);
+                _remoteDirection = remote.Direction;
+                Audio.Start(remote, SdpSession.AnswerDirection(remote, _localDirection)); SetStatus(SipCallState.Established, 200);
             }
         }
         catch (Exception error)
@@ -247,6 +327,10 @@ public sealed class SipCall : IAsyncDisposable
     }
     internal async Task OnResponseAsync(SipMessage response)
     {
+        SipMessage? refreshAck;
+        lock (_gate) refreshAck = response.CSeqMethod == "INVITE" && response.StatusCode is >= 200 and < 300 &&
+            response.CSeqNumber == _lastRefreshSequence ? _lastRefreshAck : null;
+        if (refreshAck is not null) { await _client.SendAsync(refreshAck); return; }
         if (_invite is null || response.CSeqMethod != "INVITE" || response.CSeqNumber != _invite.CSeqNumber ||
             SipMessage.Parameter(response.Get("From"), "tag") != _localTag ||
             SipMessage.Parameter(response.Get("Via"), "branch") != SipMessage.Parameter(_invite.Get("Via"), "branch")) return;
@@ -283,14 +367,359 @@ public sealed class SipCall : IAsyncDisposable
         }
         if (!matches)
         { if (request.Method != "ACK") await _client.ReplyAsync(request, SipMessage.Response(request, 481, "Call/Transaction Does Not Exist")); return; }
-        if (request.Method == "ACK") { if (_invite?.CSeqNumber == request.CSeqNumber) _ack.TrySetResult(); return; }
+        if (request.Method == "ACK")
+        {
+            if (_invite?.CSeqNumber == request.CSeqNumber) _ack.TrySetResult();
+            else lock (_gate) if (_pendingRefresh is { } pending && pending.Sequence == request.CSeqNumber) pending.Ack.TrySetResult(request);
+            return;
+        }
         if (request.CSeqNumber <= _remoteSequence)
         { await _client.ReplyAsync(request, SipMessage.Response(request, 500, "CSeq Out of Order")); return; }
         _remoteSequence = request.CSeqNumber;
         if (request.Method == "BYE")
         { await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK")); await EndAsync(SipCallEndReason.RemoteHangup); }
         else if (request.Method == "OPTIONS") await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK"));
-        else await _client.ReplyAsync(request, SipMessage.Response(request, request.Method == "INVITE" ? 488 : 405, "Not Supported", _localTag));
+        else if (request.Method is "INVITE" or "UPDATE") await OnSessionRefreshAsync(request);
+        else if (request.Method == "NOTIFY") await OnNotifyAsync(request);
+        else await _client.ReplyAsync(request, SipMessage.Response(request, 405, "Method Not Allowed", _localTag));
+    }
+    /// <summary>
+    /// Sends a re-INVITE with a new offer for the given local direction (RFC 3261 section 14.1).
+    /// Only one re-INVITE runs at a time. 491 is retried after a random delay; 408 and 481 end the
+    /// dialog with BYE (RFC 3261 section 12.2.1.2); any other failure leaves the session unchanged.
+    /// </summary>
+    private async Task RenegotiateAsync(SipMediaDirection local, CancellationToken cancellationToken)
+    {
+        await _renegotiation.WaitAsync(cancellationToken);
+        try
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                SipMessage request;
+                lock (_gate)
+                {
+                    if (Status.State != SipCallState.Established || _ending) throw new InvalidOperationException("Only an established call can be held or resumed.");
+                    if (_pendingRefresh is not null) throw new InvalidOperationException("A remote re-INVITE is still in progress.");
+                    _outgoingRefresh = true;
+                    request = DialogRequest("INVITE");
+                    request.Add("Content-Type", "application/sdp");
+                    request.Body = Encoding.UTF8.GetBytes(SdpSession.Offer(_client.MediaAddress, Audio.Port, Audio.MasterKey,
+                        NewSdpOrigin(), Audio.ControlPort, local, ++_sdpVersion));
+                }
+                SipMessage response;
+                try
+                {
+                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _stop.Token);
+                    response = await _client.RequestAuthenticatedAsync(request, null, linked.Token);
+                }
+                catch (TimeoutException error)
+                {
+                    lock (_gate) _outgoingRefresh = false;
+                    await TerminateDialogAsync("re-INVITE timed out: " + error.Message);
+                    throw new SipException(408, "The remote side did not answer the re-INVITE; the call was ended.");
+                }
+                catch { lock (_gate) _outgoingRefresh = false; throw; }
+                if (response.StatusCode is >= 200 and < 300)
+                {
+                    SdpSession answer;
+                    lock (_gate)
+                    {
+                        _lastRefreshSequence = response.CSeqNumber;
+                        string contact = response.Get("Contact");
+                        if (contact.Length > 0) _remoteTarget = SipMessage.UriFromHeader(contact);
+                        _lastRefreshAck = DialogRequest("ACK", response.CSeqNumber);
+                    }
+                    await _client.SendAsync(_lastRefreshAck);
+                    try { answer = SdpSession.Parse(response.Body, _client.Config.MediaSecurity); }
+                    catch (Exception error) when (error is InvalidDataException or NotSupportedException or FormatException)
+                    {
+                        lock (_gate) _outgoingRefresh = false;
+                        // RFC 3261 section 14.1: an unusable answer after the ACK ends the session.
+                        await TerminateDialogAsync("Unusable re-INVITE answer: " + error.Message);
+                        throw new SipException(488, "The remote answer to the re-INVITE was not usable; the call was ended.");
+                    }
+                    lock (_gate)
+                    {
+                        _localDirection = local; _remoteDirection = answer.Direction; _outgoingRefresh = false;
+                        Audio.Update(answer, SdpSession.AnswerDirection(answer, local));
+                    }
+                    Publish(MediaChanged, answer.Direction);
+                    return;
+                }
+                lock (_gate) _outgoingRefresh = false;
+                if (response.StatusCode == 491 && attempt < 2)
+                {
+                    double wait = GlareRetryMinimum.TotalMilliseconds + Random.Shared.NextDouble() * (GlareRetryMaximum - GlareRetryMinimum).TotalMilliseconds;
+                    await Task.Delay(TimeSpan.FromMilliseconds(wait), _client.Time, cancellationToken);
+                    continue;
+                }
+                if (response.StatusCode is 408 or 481)
+                {
+                    await TerminateDialogAsync($"re-INVITE answered {response.StatusCode} {response.ReasonPhrase}");
+                    throw new SipException(response.StatusCode, $"The dialog no longer exists (SIP {response.StatusCode}); the call was ended.");
+                }
+                throw new SipException(response.StatusCode, $"Re-INVITE rejected (SIP {response.StatusCode} {response.ReasonPhrase}); the call continues unchanged.");
+            }
+        }
+        finally { _renegotiation.Release(); }
+    }
+    /// <summary>
+    /// Blind transfer (RFC 3515, RFC 5589 section 6): asks the PBX with REFER to connect the remote party
+    /// to <paramref name="target"/>, an extension or number in the registrar's domain or a full sip:/sips: URI.
+    /// The PBX reports progress with NOTIFY (message/sipfrag). On a 2xx result this side ends its leg with BYE
+    /// and the call ends as <see cref="SipCallEndReason.Transferred"/>. If the REFER or the target fails, the
+    /// call stays with this side; hold it first with <see cref="HoldAsync"/> if the caller should hear hold audio.
+    /// </summary>
+    public Task<SipTransferResult> TransferAsync(string target, CancellationToken cancellationToken = default) =>
+        TransferCoreAsync(TransferTargetUri(target), null, cancellationToken);
+    /// <summary>
+    /// Attended transfer (RFC 5589 section 7, RFC 3891): connects the remote party of this call with the remote
+    /// party of <paramref name="consultation"/>, an established call of the same client in which this side has
+    /// announced the caller. This call should be held during the consultation (<see cref="HoldAsync"/>). The REFER
+    /// carries a Replaces header for the consultation dialog, so the PBX joins both remote parties and this side
+    /// leaves both calls. On a 2xx result this call ends as <see cref="SipCallEndReason.Transferred"/>; the
+    /// consultation call is ended by the PBX, or by this side if the PBX leaves it open. If the transfer fails,
+    /// both calls stay as they are and the application decides (resume this call, end the consultation).
+    /// </summary>
+    public Task<SipTransferResult> TransferToCallAsync(SipCall consultation, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(consultation);
+        if (ReferenceEquals(consultation, this)) throw new ArgumentException("A call cannot be transferred to itself.", nameof(consultation));
+        if (!ReferenceEquals(consultation._client, _client)) throw new ArgumentException("Both calls must belong to the same SIP client.", nameof(consultation));
+        if (consultation.Status.State != SipCallState.Established) throw new InvalidOperationException("The consultation call is not established.");
+        return TransferCoreAsync(consultation.ReplacesUri(), consultation, cancellationToken);
+    }
+    /// <summary>Target URI of this dialog with an RFC 3891 Replaces header, as seen from the remote side's dialog state.</summary>
+    internal string ReplacesUri()
+    {
+        lock (_gate)
+        {
+            string remoteTag = SipMessage.Parameter(_remoteHeader, "tag");
+            if (remoteTag.Length == 0) throw new InvalidOperationException("The consultation dialog has no remote tag.");
+            string uri = SipMessage.UriFromHeader(_remoteHeader).Split('?')[0];
+            // RFC 3891 section 3: to-tag matches the local tag and from-tag the remote tag of the dialog at the UA that receives the INVITE with Replaces.
+            return $"{uri}?Replaces={Uri.EscapeDataString(Id)}%3Bto-tag%3D{Uri.EscapeDataString(remoteTag)}%3Bfrom-tag%3D{Uri.EscapeDataString(_localTag)}";
+        }
+    }
+    private async Task<SipTransferResult> TransferCoreAsync(string targetUri, SipCall? consultation, CancellationToken cancellationToken)
+    {
+        await _renegotiation.WaitAsync(cancellationToken);
+        try
+        {
+            SipMessage request; TaskCompletionSource<(int Code, string Phrase)> result;
+            lock (_gate)
+            {
+                if (Status.State != SipCallState.Established || _ending) throw new InvalidOperationException("Only an established call can be transferred.");
+                result = _transferResult = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                request = DialogRequest("REFER");
+                request.Add("Refer-To", "<" + targetUri + ">");
+                request.Add("Referred-By", $"<sip:{Uri.EscapeDataString(_client.Config.User)}@{_client.Config.SipDomain}>");
+            }
+            try
+            {
+                SipMessage response;
+                using (var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _stop.Token))
+                {
+                    try { response = await _client.RequestAuthenticatedAsync(request, null, linked.Token); }
+                    catch (TimeoutException) { return new(SipTransferOutcome.Failed, 408, "The PBX did not answer the REFER."); }
+                }
+                if (response.StatusCode >= 300) return new(SipTransferOutcome.Failed, response.StatusCode, response.ReasonPhrase);
+                // The target may ring for up to the call answer timeout before the PBX sends the final NOTIFY.
+                using var deadline = new CancellationTokenSource(_client.Config.CallAnswerTimeout + _client.Config.TransactionTimeout, _client.Time);
+                using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token, _stop.Token);
+                (int Code, string Phrase) final;
+                try { final = await result.Task.WaitAsync(wait.Token); }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    return new(SipTransferOutcome.Unknown, null, Status.State == SipCallState.Ended
+                        ? "The call ended before the PBX reported the transfer result."
+                        : "The PBX accepted the transfer but reported no final result.");
+                }
+                if (final.Code == 0) return new(SipTransferOutcome.Unknown, null, final.Phrase);
+                if (final.Code is < 200 or >= 300) return new(SipTransferOutcome.Failed, final.Code, final.Phrase);
+                // RFC 5589 section 6: after a successful transfer the transferor ends its dialog.
+                bool established;
+                lock (_gate) { established = Status.State == SipCallState.Established && !_ending; if (established) { _ending = true; SetStatus(SipCallState.Ending); } }
+                if (established)
+                {
+                    try { await SendByeAsync(CancellationToken.None); }
+                    catch (Exception error) { _client.Report("transfer", error.Message); }
+                    finally { await EndAsync(SipCallEndReason.Transferred, final.Code, phrase: final.Phrase); }
+                }
+                if (consultation is not null)
+                {
+                    // The PBX normally ends the replaced consultation dialog itself; do not leave it open.
+                    using var grace = new CancellationTokenSource(_client.Config.TransactionTimeout, _client.Time);
+                    try { await consultation.Completion.WaitAsync(grace.Token); }
+                    catch (OperationCanceledException)
+                    {
+                        try { await consultation.HangupAsync(CancellationToken.None); }
+                        catch (Exception error) { _client.Report("transfer", error.Message); }
+                    }
+                }
+                return new(SipTransferOutcome.Succeeded, final.Code, final.Phrase);
+            }
+            finally { lock (_gate) if (ReferenceEquals(_transferResult, result)) _transferResult = null; }
+        }
+        finally { _renegotiation.Release(); }
+    }
+    private string TransferTargetUri(string target)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(target);
+        if (target.Any(c => char.IsControl(c) || char.IsWhiteSpace(c) || c is '<' or '>' or '"'))
+            throw new ArgumentException("Invalid transfer target.", nameof(target));
+        if (target.StartsWith("sip:", StringComparison.OrdinalIgnoreCase) || target.StartsWith("sips:", StringComparison.OrdinalIgnoreCase))
+            return target;
+        if (target.Contains('@') || target.Contains(':')) throw new ArgumentException("Use an extension, a number or a full sip: URI.", nameof(target));
+        return $"sip:{Uri.EscapeDataString(target)}@{_client.Config.SipDomain}";
+    }
+    /// <summary>
+    /// NOTIFY for the implicit REFER subscription (RFC 3515 section 2.4.4, RFC 6665). The body is a
+    /// message/sipfrag status line; a final status or a terminated subscription completes the transfer wait.
+    /// </summary>
+    private async Task OnNotifyAsync(SipMessage request)
+    {
+        string eventPackage = request.Get("Event").Split(';')[0].Trim();
+        if (!eventPackage.Equals("refer", StringComparison.OrdinalIgnoreCase))
+        { await _client.ReplyAsync(request, SipMessage.Response(request, 489, "Bad Event", _localTag)); return; }
+        await _client.ReplyAsync(request, SipMessage.Response(request, 200, "OK", _localTag));
+        int code = 0; string phrase = "";
+        string fragment = Encoding.UTF8.GetString(request.Body).Split('\n')[0].Trim();
+        var parts = fragment.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2 && parts[0].StartsWith("SIP/", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(parts[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int parsed))
+        { code = parsed; phrase = parts.Length > 2 ? parts[2] : ""; }
+        bool terminated = request.Get("Subscription-State").TrimStart().StartsWith("terminated", StringComparison.OrdinalIgnoreCase);
+        TaskCompletionSource<(int Code, string Phrase)>? pending;
+        lock (_gate) pending = _transferResult;
+        if (pending is null) return;
+        if (code >= 200) pending.TrySetResult((code, phrase));
+        else if (terminated) pending.TrySetResult((0, "The PBX ended the transfer subscription without a final result."));
+    }
+    private async Task TerminateDialogAsync(string reason)
+    {
+        _client.Report("re-invite", reason);
+        try { await SendByeAsync(CancellationToken.None); } catch (Exception error) { _client.Report("re-invite", error.Message); }
+        await EndAsync(SipCallEndReason.ProtocolError, error: reason);
+    }
+    private long NewSdpOrigin()
+    {
+        lock (_gate)
+        {
+            if (_sdpId == 0) _sdpId = _client.Time.GetUtcNow().ToUnixTimeMilliseconds();
+            return _sdpId;
+        }
+    }
+    /// <summary>
+    /// Handles a re-INVITE (RFC 3261 section 14.2) or UPDATE (RFC 3311) inside the dialog. PBXs send
+    /// these to hold, resume, park or re-route a call and as session refreshes; rejecting them can drop
+    /// the call. The body is an RFC 3264 offer; a re-INVITE without a body asks this side to offer and
+    /// receives the answer in the ACK.
+    /// </summary>
+    private async Task OnSessionRefreshAsync(SipMessage request)
+    {
+        bool invite = request.Method == "INVITE";
+        SipMessage response = BuildSessionRefreshResponse(request, invite, out bool changed);
+        // Handlers run outside the call lock so they may query or control the call.
+        if (changed) Publish(MediaChanged, RemoteMediaDirection);
+        await _client.ReplyAsync(request, response);
+        if (invite && response.StatusCode == 200) _ = AwaitRefreshAckAsync(response);
+    }
+    private SipMessage BuildSessionRefreshResponse(SipMessage request, bool invite, out bool changed)
+    {
+        changed = false;
+        lock (_gate)
+        {
+            SipMessage response;
+            if (invite && _outgoingRefresh)
+                return SipMessage.Response(request, 491, "Request Pending", _localTag);
+            if (Status.State != SipCallState.Established || (invite && _pendingRefresh is not null))
+            {
+                // RFC 3261 section 14.2: an INVITE that overlaps an unfinished INVITE transaction is retried later.
+                response = SipMessage.Response(request, 500, "Server Internal Error", _localTag);
+                response.Add("Retry-After", "1");
+                return response;
+            }
+            if (request.Get("Require").Length > 0)
+            {
+                response = SipMessage.Response(request, 420, "Bad Extension", _localTag);
+                response.Add("Unsupported", request.Get("Require"));
+                return response;
+            }
+            SdpSession? offer = null;
+            if (request.Body.Length > 0)
+            {
+                try { offer = SdpSession.Parse(request.Body, _client.Config.MediaSecurity); }
+                catch (Exception error) when (error is InvalidDataException or NotSupportedException or FormatException)
+                {
+                    _client.Report("session-refresh", error.Message);
+                    return SipMessage.Response(request, 488, "Not Acceptable Here", _localTag);
+                }
+            }
+            string contact = request.Get("Contact");
+            if (contact.Length > 0) _remoteTarget = SipMessage.UriFromHeader(contact);
+            response = SipMessage.Response(request, 200, "OK", _localTag);
+            response.Add("Contact", _client.Contact);
+            if (offer is not null)
+            {
+                var direction = SdpSession.AnswerDirection(offer, _localDirection);
+                response.Add("Content-Type", "application/sdp");
+                response.Body = Encoding.UTF8.GetBytes(SdpSession.Answer(_client.MediaAddress, Audio.Port, Audio.MasterKey,
+                    NewSdpOrigin(), offer, _localDirection, ++_sdpVersion, Audio.ControlPort));
+                Audio.Update(offer, direction); _remoteDirection = offer.Direction; changed = true;
+            }
+            else if (invite)
+            {
+                response.Add("Content-Type", "application/sdp");
+                response.Body = Encoding.UTF8.GetBytes(SdpSession.Offer(_client.MediaAddress, Audio.Port, Audio.MasterKey,
+                    NewSdpOrigin(), Audio.ControlPort, _localDirection, ++_sdpVersion));
+            }
+            if (invite) _pendingRefresh = (request.CSeqNumber, new(TaskCreationOptions.RunContinuationsAsynchronously), offer is null);
+            return response;
+        }
+    }
+    private async Task AwaitRefreshAckAsync(SipMessage response)
+    {
+        // RFC 3261 section 13.3.1.4: retransmit the 2xx until the ACK arrives; without an ACK the dialog ends.
+        (int Sequence, TaskCompletionSource<SipMessage> Ack, bool OfferInAck) pending;
+        lock (_gate)
+        {
+            if (_pendingRefresh is null) return;
+            pending = _pendingRefresh.Value;
+        }
+        try
+        {
+            using var deadline = new CancellationTokenSource(_client.Config.TransactionTimeout, _client.Time);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, _stop.Token);
+            TimeSpan interval = _client.Config.InitialRetransmitInterval;
+            while (!pending.Ack.Task.IsCompleted)
+            {
+                using var tick = CancellationTokenSource.CreateLinkedTokenSource(linked.Token);
+                var delay = Task.Delay(interval, _client.Time, tick.Token);
+                if (await Task.WhenAny(pending.Ack.Task, delay) == pending.Ack.Task) { tick.Cancel(); break; }
+                await delay;
+                await _client.SendAsync(response, linked.Token);
+                interval = TimeSpan.FromMilliseconds(Math.Min(interval.TotalMilliseconds * 2, 4000));
+            }
+            var ack = await pending.Ack.Task;
+            if (pending.OfferInAck)
+            {
+                var answer = SdpSession.Parse(ack.Body, _client.Config.MediaSecurity);
+                lock (_gate) { Audio.Update(answer, SdpSession.AnswerDirection(answer, _localDirection)); _remoteDirection = answer.Direction; }
+                Publish(MediaChanged, answer.Direction);
+            }
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            _client.Report("session-refresh", error.Message);
+            if (Status.State == SipCallState.Established)
+            {
+                try { await SendByeAsync(CancellationToken.None); } catch (Exception bye) { _client.Report("session-refresh", bye.Message); }
+                await EndAsync(SipCallEndReason.ProtocolError, error: error.Message);
+            }
+        }
+        finally { lock (_gate) if (_pendingRefresh?.Sequence == pending.Sequence) _pendingRefresh = null; }
     }
     internal async Task EndAsync(SipCallEndReason reason, int? code = null, string? error = null, string? phrase = null)
     {
@@ -311,8 +740,8 @@ public sealed class SipCall : IAsyncDisposable
         var status = new SipCallStatus(state, _client.Time.GetUtcNow(), reason, code, error, phrase);
         Volatile.Write(ref _status, status); Publish(StatusChanged, status);
     }
-    private void Publish(EventHandler<SipCallStatus>? handlers, SipCallStatus status)
-    { foreach (EventHandler<SipCallStatus> h in handlers?.GetInvocationList() ?? []) try { h(this, status); } catch { } }
+    private void Publish<T>(EventHandler<T>? handlers, T value)
+    { foreach (EventHandler<T> h in handlers?.GetInvocationList() ?? []) try { h(this, value); } catch { } }
     public async ValueTask DisposeAsync()
     { if (Status.State != SipCallState.Ended) await HangupAsync(); await Audio.DisposeAsync(); }
 }

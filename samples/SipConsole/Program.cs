@@ -31,16 +31,83 @@ try
     void Attach(SipCall call)
     {
         call.StatusChanged += (_, status) => Console.WriteLine($"Call {call.Id}: {status.State} {status.EndReason}");
+        call.MediaChanged += (_, remote) => Console.WriteLine($"Call {call.Id}: media renegotiated, remote={remote} local={call.Audio.Direction}");
         call.Audio.MetricsChanged += (_, m) =>
         {
             string rtt = m.RoundTripMilliseconds.HasValue ? m.RoundTripMilliseconds.Value.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) + "ms" : "unknown";
             Console.WriteLine($"Call {call.Id}: codec={m.Codec} TX={m.TransmittedPackets} RX={m.ReceivedPackets} lost={m.LostPackets} jitter={m.JitterMilliseconds:F1}ms queue={m.QueuedAudio.TotalMilliseconds:F0}ms rtt={rtt} RTCP={m.Control?.TransmittedPackets}/{m.Control?.ReceivedPackets}");
         };
+        if (args.Contains("--hold-test")) operations.Add(ObserveAsync(async () =>
+        {
+            // Five seconds after establishment: hold, play a 440 Hz waiting tone for six seconds, resume.
+            while (call.Status.State is not (SipCallState.Established or SipCallState.Ended)) await Task.Delay(50, stop.Token);
+            if (call.Status.State == SipCallState.Ended) return;
+            await Task.Delay(TimeSpan.FromSeconds(5), stop.Token);
+            Console.WriteLine($"Call {call.Id}: holding"); await call.HoldAsync(stop.Token);
+            Console.WriteLine($"Call {call.Id}: on hold, local={call.Audio.Direction} remote={call.RemoteMediaDirection}");
+            var tone = Enumerable.Range(0, 480).Select(i => (short)(6000 * Math.Sin(2 * Math.PI * 440 * i / 24000))).ToArray();
+            for (int i = 0; i < 300 && call.Status.State == SipCallState.Established; i++)
+            { while (!call.Audio.TryWrite(tone, 24000)) await Task.Delay(10, stop.Token); }
+            await call.Audio.WaitForDrainAsync(TimeSpan.FromSeconds(10), stop.Token);
+            Console.WriteLine($"Call {call.Id}: resuming"); await call.ResumeAsync(stop.Token);
+            Console.WriteLine($"Call {call.Id}: resumed, local={call.Audio.Direction} remote={call.RemoteMediaDirection}");
+        }));
+        int attendedIndex = Array.IndexOf(args, "--attended-test");
+        if (attendedIndex >= 0 && call.Direction == SipCallDirection.Incoming) operations.Add(ObserveAsync(async () =>
+        {
+            // Attended transfer demo: hold the caller with a tone, call the target, announce with a tone, then
+            // join both. If the target does not answer within 20 seconds, the caller is taken back.
+            while (call.Status.State is not (SipCallState.Established or SipCallState.Ended)) await Task.Delay(50, stop.Token);
+            if (call.Status.State == SipCallState.Ended) return;
+            await Task.Delay(TimeSpan.FromSeconds(5), stop.Token);
+            static short[] Tone(int hz) => Enumerable.Range(0, 480).Select(i => (short)(6000 * Math.Sin(2 * Math.PI * hz * i / 24000))).ToArray();
+            using var holdMusic = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
+            Console.WriteLine($"Call {call.Id}: holding caller"); await call.HoldAsync(stop.Token);
+            var music = Task.Run(async () =>
+            {
+                var tone = Tone(440); var pause = new short[480];
+                try { for (int i = 0; !holdMusic.IsCancellationRequested; i++) { var frame = i % 50 < 25 ? tone : pause; while (!call.Audio.TryWrite(frame, 24000)) await Task.Delay(10, holdMusic.Token); } }
+                catch (OperationCanceledException) { }
+            });
+            var consultation = client.CreateCall(args[attendedIndex + 1]); Attach(consultation);
+            Console.WriteLine($"Call {call.Id}: consulting {args[attendedIndex + 1]} as {consultation.Id}");
+            using var ring = CancellationTokenSource.CreateLinkedTokenSource(stop.Token); ring.CancelAfter(TimeSpan.FromSeconds(20));
+            bool answered;
+            try { await consultation.StartAsync(ring.Token); answered = true; }
+            catch (Exception error) { answered = false; Console.WriteLine($"Call {call.Id}: consultation failed: {error.Message}"); }
+            if (answered)
+            {
+                var announce = Tone(660);
+                for (int i = 0; i < 150; i++) while (!consultation.Audio.TryWrite(announce, 24000)) await Task.Delay(10, stop.Token);
+                await consultation.Audio.WaitForDrainAsync(TimeSpan.FromSeconds(5), stop.Token);
+                Console.WriteLine($"Call {call.Id}: transferring to consultation {consultation.Id}");
+                holdMusic.Cancel(); await music;
+                var result = await call.TransferToCallAsync(consultation, stop.Token);
+                Console.WriteLine($"Call {call.Id}: attended transfer {result.Outcome} {result.StatusCode} {result.ReasonPhrase}");
+                if (result.Outcome == SipTransferOutcome.Succeeded) return;
+                await consultation.HangupAsync(stop.Token);
+            }
+            holdMusic.Cancel(); await music;
+            Console.WriteLine($"Call {call.Id}: taking caller back"); await call.ResumeAsync(stop.Token);
+            Console.WriteLine($"Call {call.Id}: caller back, local={call.Audio.Direction}");
+        }));
+        int transferIndex = Array.IndexOf(args, "--transfer-test");
+        if (transferIndex >= 0) operations.Add(ObserveAsync(async () =>
+        {
+            // Five seconds after establishment: blind transfer to the given extension, number or sip: URI.
+            while (call.Status.State is not (SipCallState.Established or SipCallState.Ended)) await Task.Delay(50, stop.Token);
+            if (call.Status.State == SipCallState.Ended) return;
+            await Task.Delay(TimeSpan.FromSeconds(5), stop.Token);
+            Console.WriteLine($"Call {call.Id}: transferring to {args[transferIndex + 1]}");
+            var result = await call.TransferAsync(args[transferIndex + 1], stop.Token);
+            Console.WriteLine($"Call {call.Id}: transfer {result.Outcome} {result.StatusCode} {result.ReasonPhrase}");
+        }));
         if (args.Contains("--echo")) operations.Add(ObserveAsync(async () =>
         {
             await foreach (var frame in call.Audio.ReadFramesAsync(stop.Token))
             {
                 if (call.Status.State == SipCallState.Ended) break;
+                if (call.IsOnHold) continue;
                 if (!call.Audio.TryWrite(frame.Samples.Span, frame.SampleRate) && call.Status.State != SipCallState.Ended)
                     Console.WriteLine("Echo transmit queue full.");
             }
@@ -51,6 +118,12 @@ try
     client.IncomingCall += (_, call) =>
     {
         Attach(call); Console.WriteLine($"Incoming call {call.Id} from {call.RemoteUri}. Use: answer {call.Id}");
+        if (args.Contains("--show-identity"))
+        {
+            Console.WriteLine($"Call {call.Id}: caller number={call.RemoteIdentity.Number ?? "-"} name={call.RemoteIdentity.DisplayName ?? "-"} anonymous={call.RemoteIdentity.Anonymous}");
+            Console.WriteLine($"Call {call.Id}: dialled number={call.CalledIdentity?.Number ?? "-"} diversions={string.Join(" <- ", call.Diversions.Select(d => d.Number ?? d.Uri))}");
+            foreach (var header in call.InitialHeaders) Console.WriteLine($"Call {call.Id}: header {header.Key}: {header.Value}");
+        }
         if (args.Contains("--auto-answer")) operations.Add(ObserveAsync(() => call.AnswerAsync(stop.Token)));
     };
     await client.ConnectAsync(stop.Token);

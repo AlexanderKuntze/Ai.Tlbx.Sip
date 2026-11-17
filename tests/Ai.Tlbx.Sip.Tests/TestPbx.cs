@@ -36,6 +36,25 @@ internal sealed class TestPbx : IAsyncDisposable
     public int? GrantedExpirySeconds { get; init; }
     public volatile bool DropRegistrationResponses;
     public int AckRequests { get; private set; }
+    public SipMessage? LastRefer { get; private set; }
+    public int RejectReferWith { get; set; }
+    public int TransferFinalCode { get; set; } = 200;
+    public bool EndReplacedDialog { get; set; } = true;
+    private readonly Dictionary<string, (SipMessage Invite, SipMessage Answer)> _answered = [];
+    private int _notifySequence = 100;
+    private SipMessage ReferNotify(SipMessage refer, string fragment, string state)
+    {
+        var notify = new SipMessage { StartLine = $"NOTIFY {SipMessage.UriFromHeader(refer.Get("Contact"))} SIP/2.0" };
+        notify.Add("Via", $"SIP/2.0/UDP 127.0.0.1:{Port};branch=z9hG4bK{Guid.NewGuid():N}");
+        notify.Add("From", refer.Get("To")); notify.Add("To", refer.Get("From")); notify.Add("Call-ID", refer.Get("Call-ID"));
+        notify.Add("CSeq", $"{++_notifySequence} NOTIFY"); notify.Add("Event", "refer"); notify.Add("Subscription-State", state);
+        notify.Add("Content-Type", "message/sipfrag"); notify.Body = Encoding.UTF8.GetBytes(fragment + "\r\n");
+        return notify;
+    }
+    public int ReinviteRequests { get; private set; }
+    public SipMessage? LastReinvite { get; private set; }
+    /// <summary>Final status codes for the next client re-INVITEs, consumed in order.</summary>
+    public System.Collections.Concurrent.ConcurrentQueue<int> RejectReinvites { get; } = new();
     public int CancelRequests { get; private set; }
     public int ByeRequests { get; private set; }
     public bool CancelMatchesInvite { get; private set; }
@@ -80,6 +99,40 @@ internal sealed class TestPbx : IAsyncDisposable
                         response.Add("Expires", expiry); response.Add("Contact", request.Get("Contact") + ";expires=" + expiry);
                     }
                     await SendAsync(response);
+                }
+                else if (request.Method == "REFER")
+                {
+                    // RFC 3515: accept, then report the target's progress and result as message/sipfrag NOTIFYs.
+                    LastRefer = request;
+                    if (RejectReferWith > 0) { await SendAsync(SipMessage.Response(request, RejectReferWith, "Forbidden")); continue; }
+                    await SendAsync(SipMessage.Response(request, 202, "Accepted"));
+                    await SendAsync(ReferNotify(request, "SIP/2.0 100 Trying", "active;expires=60"));
+                    await SendAsync(ReferNotify(request, $"SIP/2.0 {TransferFinalCode} {(TransferFinalCode == 200 ? "OK" : "Busy Here")}", "terminated;reason=noresource"));
+                    // RFC 3891: a successful INVITE with Replaces ends the replaced dialog; the PBX sends its BYE.
+                    string referTo = Uri.UnescapeDataString(request.Get("Refer-To"));
+                    int replaces = referTo.IndexOf("?Replaces=", StringComparison.Ordinal);
+                    if (TransferFinalCode == 200 && EndReplacedDialog && replaces > 0 &&
+                        _answered.TryGetValue(referTo[(replaces + 10)..].Split(';')[0], out var replaced))
+                    {
+                        var bye = new SipMessage { StartLine = $"BYE {SipMessage.UriFromHeader(replaced.Invite.Get("Contact"))} SIP/2.0" };
+                        bye.Add("Via", $"SIP/2.0/UDP 127.0.0.1:{Port};branch=z9hG4bK{Guid.NewGuid():N}");
+                        bye.Add("From", replaced.Answer.Get("To")); bye.Add("To", replaced.Invite.Get("From"));
+                        bye.Add("Call-ID", replaced.Invite.Get("Call-ID")); bye.Add("CSeq", $"{++_notifySequence} BYE");
+                        await SendAsync(bye);
+                    }
+                }
+                else if (request.Method == "INVITE" && SipMessage.Parameter(request.Get("To"), "tag").Length > 0)
+                {
+                    // In-dialog re-INVITE from the client: answer with the RFC 3264 complementary direction.
+                    ReinviteRequests++; LastReinvite = request;
+                    var offer = SdpSession.Parse(request.Body, Ai.Tlbx.Sip.SipMediaSecurity.Unencrypted);
+                    int reject = RejectReinvites.TryDequeue(out int code) ? code : 0;
+                    if (reject > 0) { await SendAsync(SipMessage.Response(request, reject, reject == 491 ? "Request Pending" : "Not Acceptable Here")); continue; }
+                    string answerDirection = SdpSession.Attribute(SdpSession.AnswerDirection(offer, Ai.Tlbx.Sip.SipMediaDirection.SendReceive));
+                    var reply = SipMessage.Response(request, 200, "OK");
+                    reply.Add("Contact", $"<sip:remote@127.0.0.1:{Port}>"); reply.Add("Content-Type", "application/sdp");
+                    reply.Body = Encoding.UTF8.GetBytes(TestSdp().Replace("a=sendrecv\r\n", $"a={answerDirection}\r\n"));
+                    await SendAsync(reply);
                 }
                 else if (request.Method == "INVITE")
                 {
@@ -139,7 +192,8 @@ internal sealed class TestPbx : IAsyncDisposable
     {
         var answer = SipMessage.Response(_outgoingInvite!, 200, "OK", "remote-tag");
         answer.Add("Contact", $"<sip:remote@127.0.0.1:{Port}>"); answer.Add("Content-Type", "application/sdp");
-        answer.Body = Encoding.UTF8.GetBytes(TestSdp()); _lastInviteAnswer = answer; await SendAsync(answer);
+        answer.Body = Encoding.UTF8.GetBytes(TestSdp()); _lastInviteAnswer = answer;
+        _answered[_outgoingInvite!.Get("Call-ID")] = (_outgoingInvite, answer); await SendAsync(answer);
     }
     public Task RepeatFinalAsync() => SendAsync(_lastInviteAnswer!);
     public async Task<SipMessage> WaitResponseAsync(string method, int code)
@@ -149,17 +203,32 @@ internal sealed class TestPbx : IAsyncDisposable
             while (_responses.Reader.TryRead(out var message)) if (message.CSeqMethod == method && message.StatusCode == code) return message;
         throw new Exception("No matching response.");
     }
-    public async Task<SipMessage> InviteAsync()
+    public async Task<SipMessage> InviteAsync(string from = "<sip:remote@example.test>", params (string Name, string Value)[] extraHeaders)
     {
         var invite = new SipMessage { StartLine = "INVITE sip:test-user@example.test SIP/2.0" };
         invite.Add("Via", $"SIP/2.0/UDP 127.0.0.1:{Port};branch=z9hG4bKtestincoming");
-        invite.Add("From", "<sip:remote@example.test>;tag=remote-tag"); invite.Add("To", "<sip:test-user@example.test>");
+        invite.Add("From", from + ";tag=remote-tag"); invite.Add("To", "<sip:test-user@example.test>");
+        foreach (var (name, value) in extraHeaders) invite.Add(name, value);
         invite.Add("Call-ID", Guid.NewGuid().ToString("N")); invite.Add("CSeq", "1 INVITE");
         invite.Add("Contact", $"<sip:remote@127.0.0.1:{Port}>"); invite.Add("Content-Type", "application/sdp");
         invite.Body = Encoding.UTF8.GetBytes(TestSdp()); await SendAsync(invite); return invite;
     }
     public Task AckAsync(SipMessage invite, SipMessage answer) => SendAsync(DialogRequest("ACK", 1, invite, answer));
     public Task ByeAsync(SipMessage invite, SipMessage answer) => SendAsync(DialogRequest("BYE", 2, invite, answer));
+    /// <summary>Sends an in-dialog re-INVITE or UPDATE whose SDP declares the given direction (null: no body).</summary>
+    public async Task<SipMessage> SessionRefreshAsync(string method, int sequence, SipMessage invite, SipMessage answer, string? direction)
+    {
+        var request = DialogRequest(method, sequence, invite, answer);
+        request.Add("Contact", $"<sip:remote@127.0.0.1:{Port}>");
+        if (direction is not null)
+        {
+            request.Add("Content-Type", "application/sdp");
+            request.Body = Encoding.UTF8.GetBytes(TestSdp().Replace("a=sendrecv\r\n", $"a={direction}\r\n"));
+        }
+        await SendAsync(request); return request;
+    }
+    public Task AckAsync(SipMessage invite, SipMessage answer, int sequence) => SendAsync(DialogRequest("ACK", sequence, invite, answer));
+    public Task ByeAsync(SipMessage invite, SipMessage answer, int sequence) => SendAsync(DialogRequest("BYE", sequence, invite, answer));
     private SipMessage DialogRequest(string method, int sequence, SipMessage invite, SipMessage answer)
     {
         var request = new SipMessage { StartLine = $"{method} {SipMessage.UriFromHeader(answer.Get("Contact"))} SIP/2.0" };
@@ -180,6 +249,18 @@ internal sealed class TestPbx : IAsyncDisposable
         }
     }
     public void AdvanceMediaClock(int milliseconds) => _mediaTimestamp += (uint)(milliseconds * 8);
+    /// <summary>Restarts the PBX media stream like a PBX after hold, resume or transfer: new SSRC, new sequence.</summary>
+    public async Task SendAudioFromNewSourceAsync(uint ssrc, ushort firstSequence)
+    {
+        var codec = new Ai.Tlbx.Sip.Media.AudioCodec(UseG722 ? "G722" : "PCMA");
+        for (int i = 0; i < 8; i++)
+        {
+            var packet = Check.Rtp((ushort)(firstSequence + i), _mediaTimestamp, codec.Encode(new short[codec.SampleRate / 50]));
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(8), ssrc);
+            packet[1] = UseG722 ? (byte)9 : (byte)8; _mediaTimestamp += 160;
+            await _rtp.SendAsync(packet, _clientMedia!); await Task.Delay(20);
+        }
+    }
     private string TestSdp() => UseG722 ? SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1, ((IPEndPoint)_rtcp.Client.LocalEndPoint!).Port)
         : SdpSession.Offer(IPAddress.Loopback, MediaPort, null, 1, ((IPEndPoint)_rtcp.Client.LocalEndPoint!).Port).Replace(" 9 8 0\r\n", " 8 0\r\n").Replace("a=rtpmap:9 G722/8000\r\n", "");
     public async ValueTask DisposeAsync()

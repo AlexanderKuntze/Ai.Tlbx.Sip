@@ -8,7 +8,11 @@ internal sealed class SrtpContext : IDisposable
 {
     private readonly byte[] _encryption, _authentication, _salt;
     private long _highest = -1;
-    private ulong _replay;
+    // RFC 3711 section 3.2.3: rollover counter and replay list belong to each SSRC. A PBX switches the
+    // media source after hold, resume or transfer; one shared receive state would reject the new stream.
+    private const int MaxReceiveStreams = 8;
+    private readonly Dictionary<uint, (long Highest, ulong Replay, long LastUse)> _receive = [];
+    private long _receiveUse;
     public SrtpContext(ReadOnlySpan<byte> master, bool control = false)
     {
         if (master.Length != 30) throw new ArgumentException("SRTP requires a 16-byte key and 14-byte salt.");
@@ -34,10 +38,11 @@ internal sealed class SrtpContext : IDisposable
         }
         return result;
     }
-    private long Estimate(ushort sequence)
+    private long Estimate(ushort sequence) => Estimate(sequence, _highest);
+    private static long Estimate(ushort sequence, long highest)
     {
-        if (_highest < 0) return sequence;
-        long roc = _highest >> 16; int last = (ushort)_highest;
+        if (highest < 0) return sequence;
+        long roc = highest >> 16; int last = (ushort)highest;
         if (last < 32768 && sequence - last > 32768) roc--;
         else if (last >= 32768 && last - sequence > 32768) roc++;
         return (roc << 16) | sequence;
@@ -71,21 +76,27 @@ internal sealed class SrtpContext : IDisposable
     {
         if (packet.Length < headerLength + 10) return null;
         ushort sequence = BinaryPrimitives.ReadUInt16BigEndian(packet[2..]);
-        long index = Estimate(sequence), distance = _highest - index;
-        if (index < 0 || distance >= 64 || (distance >= 0 && (_replay & (1UL << (int)distance)) != 0)) return null;
+        uint ssrc = BinaryPrimitives.ReadUInt32BigEndian(packet[8..]);
+        var (highest, replay, _) = _receive.TryGetValue(ssrc, out var state) ? state : (-1L, 0UL, 0L);
+        long index = Estimate(sequence, highest), distance = highest - index;
+        if (index < 0 || distance >= 64 || (distance >= 0 && (replay & (1UL << (int)distance)) != 0)) return null;
         int length = packet.Length - 10;
         byte[] authenticated = new byte[length + 4]; packet[..length].CopyTo(authenticated);
         BinaryPrimitives.WriteUInt32BigEndian(authenticated.AsSpan(length), (uint)(index >> 16));
         var tag = HMACSHA1.HashData(_authentication, authenticated);
         if (!CryptographicOperations.FixedTimeEquals(tag.AsSpan(0, 10), packet[length..])) return null;
         byte[] result = packet[..length].ToArray();
-        Crypt(result.AsSpan(headerLength), BinaryPrimitives.ReadUInt32BigEndian(packet[8..]), index);
-        if (index > _highest)
+        Crypt(result.AsSpan(headerLength), ssrc, index);
+        // Only authenticated packets create or advance a stream's state.
+        if (index > highest)
         {
-            long shift = index - _highest; _replay = shift >= 64 ? 1 : (_replay << (int)shift) | 1;
-            _highest = index;
+            long shift = index - highest; replay = shift >= 64 ? 1 : (replay << (int)shift) | 1;
+            highest = index;
         }
-        else _replay |= 1UL << (int)distance;
+        else replay |= 1UL << (int)distance;
+        if (!_receive.ContainsKey(ssrc) && _receive.Count >= MaxReceiveStreams)
+            _receive.Remove(_receive.MinBy(s => s.Value.LastUse).Key);
+        _receive[ssrc] = (highest, replay, ++_receiveUse);
         return result;
     }
     public void Dispose()

@@ -419,6 +419,242 @@ var cases = new (string Name, Func<Task> Run)[]
         await pbx.ByeAsync(invite, answer); await call.Completion.WaitAsync(TimeSpan.FromSeconds(3));
         Check.That(call.Status.EndReason == SipCallEndReason.RemoteHangup);
         await client.DisconnectAsync();
+    }),
+    ("SDP media directions, legacy hold address and RFC 3264 answer directions", () =>
+    {
+        string offer = SdpSession.Offer(IPAddress.Loopback, 4000, null, 7, direction: SipMediaDirection.SendOnly, version: 9);
+        var parsed = SdpSession.Parse(Encoding.UTF8.GetBytes(offer), SipMediaSecurity.Unencrypted);
+        Check.That(offer.Contains("o=- 7 9 IN IP4") && parsed.Direction == SipMediaDirection.SendOnly && parsed.Sends && !parsed.Receives);
+        Check.That(SdpSession.AnswerDirection(parsed, SipMediaDirection.SendReceive) == SipMediaDirection.ReceiveOnly);
+        string answer = SdpSession.Answer(IPAddress.Loopback, 5000, null, 8, parsed);
+        Check.That(answer.Contains("a=recvonly\r\n") && !answer.Contains("a=sendrecv"));
+        var inactive = SdpSession.Parse(Encoding.UTF8.GetBytes(offer.Replace("a=sendonly", "a=inactive")), SipMediaSecurity.Unencrypted);
+        Check.That(SdpSession.AnswerDirection(inactive, SipMediaDirection.SendReceive) == SipMediaDirection.Inactive);
+        // Session-level attribute applies when the media section declares none; media level wins otherwise.
+        string sessionLevel = SdpSession.Offer(IPAddress.Loopback, 4000, null, 1).Replace("a=sendrecv\r\n", "").Replace("t=0 0\r\n", "t=0 0\r\na=recvonly\r\n");
+        Check.That(SdpSession.Parse(Encoding.UTF8.GetBytes(sessionLevel), SipMediaSecurity.Unencrypted).Direction == SipMediaDirection.ReceiveOnly);
+        string overridden = SdpSession.Offer(IPAddress.Loopback, 4000, null, 1).Replace("t=0 0\r\n", "t=0 0\r\na=inactive\r\n");
+        Check.That(SdpSession.Parse(Encoding.UTF8.GetBytes(overridden), SipMediaSecurity.Unencrypted).Direction == SipMediaDirection.SendReceive);
+        string legacy = SdpSession.Offer(IPAddress.Loopback, 4000, null, 1).Replace("c=IN IP4 127.0.0.1", "c=IN IP4 0.0.0.0");
+        Check.That(SdpSession.Parse(Encoding.UTF8.GetBytes(legacy), SipMediaSecurity.Unencrypted).Direction == SipMediaDirection.SendOnly);
+        Check.That(SdpSession.AnswerDirection(parsed, SipMediaDirection.SendOnly) == SipMediaDirection.Inactive);
+        return Task.CompletedTask;
+    }),
+    ("Remote hold and resume by re-INVITE and UPDATE keep the call and pause transmission", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var incoming = new TaskCompletionSource<SipCall>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.IncomingCall += (_, call) => incoming.TrySetResult(call);
+        var invite = await pbx.InviteAsync(); var call = await incoming.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var changes = new List<SipMediaDirection>(); call.MediaChanged += (_, d) => { lock (changes) changes.Add(d); };
+        var answering = call.AnswerAsync(); var answer = await pbx.WaitResponseAsync("INVITE", 200);
+        await pbx.AckAsync(invite, answer); await answering.WaitAsync(TimeSpan.FromSeconds(3));
+        await Check.EventuallyAsync(() => call.Metrics.TransmittedPackets > 2);
+
+        await pbx.SessionRefreshAsync("INVITE", 2, invite, answer, "sendonly");
+        var hold = await pbx.WaitResponseAsync("INVITE", 200);
+        string holdSdp = Encoding.UTF8.GetString(hold.Body);
+        Check.That(holdSdp.Contains("a=recvonly\r\n") && hold.Get("Contact").Length > 0, holdSdp);
+        string initialOrigin = Encoding.UTF8.GetString(answer.Body).Split("\r\n").First(l => l.StartsWith("o="));
+        string holdOrigin = holdSdp.Split("\r\n").First(l => l.StartsWith("o="));
+        Check.That(initialOrigin.Split(' ')[1] == holdOrigin.Split(' ')[1] && long.Parse(holdOrigin.Split(' ')[2]) > long.Parse(initialOrigin.Split(' ')[2]),
+            "The SDP origin must stay and its version must increase.");
+        await pbx.AckAsync(invite, answer, 2);
+        Check.That(call.RemoteMediaDirection == SipMediaDirection.SendOnly && call.Audio.Direction == SipMediaDirection.ReceiveOnly);
+        long paused = call.Metrics.TransmittedPackets; await Task.Delay(200);
+        Check.That(call.Metrics.TransmittedPackets == paused, "Media must not be sent while the remote side holds the call.");
+        Check.That(call.Status.State == SipCallState.Established);
+
+        await pbx.SessionRefreshAsync("UPDATE", 3, invite, answer, "sendrecv");
+        var resume = await pbx.WaitResponseAsync("UPDATE", 200);
+        Check.That(Encoding.UTF8.GetString(resume.Body).Contains("a=sendrecv\r\n") && call.Audio.Direction == SipMediaDirection.SendReceive);
+        await Check.EventuallyAsync(() => call.Metrics.TransmittedPackets > paused + 2);
+
+        await pbx.SessionRefreshAsync("INVITE", 4, invite, answer, "inactive");
+        var inactive = await pbx.WaitResponseAsync("INVITE", 200);
+        Check.That(Encoding.UTF8.GetString(inactive.Body).Contains("a=inactive\r\n"));
+        await pbx.AckAsync(invite, answer, 4);
+        Check.That(call.Audio.Direction == SipMediaDirection.Inactive);
+        lock (changes) Check.That(changes.SequenceEqual([SipMediaDirection.SendOnly, SipMediaDirection.SendReceive, SipMediaDirection.Inactive]));
+
+        // A session refresh without SDP is answered with an offer from the current direction; REFER stays unsupported until transfer exists.
+        await pbx.SessionRefreshAsync("UPDATE", 5, invite, answer, null);
+        var refresh = await pbx.WaitResponseAsync("UPDATE", 200);
+        Check.That(refresh.Body.Length == 0 && call.Status.State == SipCallState.Established);
+        await pbx.ByeAsync(invite, answer, 6);
+        await call.Completion.WaitAsync(TimeSpan.FromSeconds(3));
+        await client.DisconnectAsync();
+    }),
+    ("SRTP keeps rollover and replay state per SSRC so a new PBX source decrypts", () =>
+    {
+        byte[] master = SdpSession.NewMasterKey();
+        using var tx = new SrtpContext(master); using var rx = new SrtpContext(master);
+        static byte[] Packet(uint ssrc, ushort sequence)
+        {
+            var p = Check.Rtp(sequence, 0, new byte[160]); BinaryPrimitives.WriteUInt32BigEndian(p.AsSpan(8), ssrc); return p;
+        }
+        var first = tx.Protect(Packet(1, 40000), 12);
+        Check.That(rx.Unprotect(first, 12) is not null);
+        // A second source starting far below the first source's sequence must not be treated as a replay.
+        using var tx2 = new SrtpContext(master);
+        var second = tx2.Protect(Packet(2, 100), 12);
+        Check.That(rx.Unprotect(second, 12) is not null, "new SSRC with lower sequence");
+        Check.That(rx.Unprotect(second, 12) is null, "replay stays rejected per SSRC");
+        Check.That(rx.Unprotect(tx.Protect(Packet(1, 40001), 12), 12) is not null, "original SSRC continues");
+        return Task.CompletedTask;
+    }),
+    ("Receiver follows a new remote SSRC after the old source stops, as after PBX hold and resume", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var diagnostics = new List<string>(); client.Diagnostic += (_, d) => { lock (diagnostics) diagnostics.Add(d.Message); };
+        var call = client.CreateCall("123");
+        await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        await pbx.SendAudioAsync(); await Check.EventuallyAsync(() => call.Metrics.ReceivedPackets >= 8);
+        // Interleaved packets from another source while the current one is live are ignored.
+        await pbx.SendAudioFromNewSourceAsync(0xBEEF, 7);
+        long before = call.Metrics.ReceivedPackets;
+        await Task.Delay(SipCallAudio.SourceSwitchSilence + TimeSpan.FromMilliseconds(100));
+        await pbx.SendAudioFromNewSourceAsync(0xCAFE, 3);
+        await Check.EventuallyAsync(() => call.Metrics.ReceivedPackets >= before + 7);
+        lock (diagnostics) Check.That(diagnostics.Any(m => m.Contains("0000CAFE")), string.Join(" | ", diagnostics));
+        await call.HangupAsync(); await client.DisconnectAsync();
+    }),
+    ("Local hold and resume by re-INVITE, rejected hold keeps the call, 491 glare is retried", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var call = client.CreateCall("123");
+        await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        int acks = pbx.AckRequests;
+
+        await call.HoldAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        string offer = Encoding.UTF8.GetString(pbx.LastReinvite!.Body);
+        Check.That(offer.Contains("a=sendonly\r\n") && pbx.LastReinvite.Get("CSeq").EndsWith("INVITE"), offer);
+        Check.That(call.IsOnHold && call.Audio.Direction == SipMediaDirection.SendOnly && call.RemoteMediaDirection == SipMediaDirection.ReceiveOnly);
+        await Check.EventuallyAsync(() => pbx.AckRequests == acks + 1);
+        // While holding, this side may still play hold music: transmission continues.
+        long sent = call.Metrics.TransmittedPackets; await Check.EventuallyAsync(() => call.Metrics.TransmittedPackets > sent + 2);
+
+        await call.ResumeAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(Encoding.UTF8.GetString(pbx.LastReinvite.Body).Contains("a=sendrecv\r\n"));
+        Check.That(!call.IsOnHold && call.Audio.Direction == SipMediaDirection.SendReceive);
+
+        pbx.RejectReinvites.Enqueue(488);
+        try { await call.HoldAsync(); throw new Exception("Expected rejection."); }
+        catch (SipException e) { Check.That(e.StatusCode == 488); }
+        Check.That(!call.IsOnHold && call.Status.State == SipCallState.Established && call.Audio.Direction == SipMediaDirection.SendReceive);
+
+        SipCall.GlareRetryMinimum = TimeSpan.FromMilliseconds(20); SipCall.GlareRetryMaximum = TimeSpan.FromMilliseconds(40);
+        int before = pbx.ReinviteRequests; pbx.RejectReinvites.Enqueue(491);
+        await call.HoldAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(pbx.ReinviteRequests == before + 2 && call.IsOnHold);
+        await call.HangupAsync(); await client.DisconnectAsync();
+    }),
+    ("Blind transfer by REFER: success ends the leg, busy target or rejected REFER keep the call", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+
+        var busy = client.CreateCall("123"); await busy.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        pbx.TransferFinalCode = 486;
+        var failed = await busy.TransferAsync("50").WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(failed is { Outcome: SipTransferOutcome.Failed, StatusCode: 486 } && busy.Status.State == SipCallState.Established, failed.ToString());
+        Check.That(pbx.LastRefer!.Get("Refer-To") == "<sip:50@example.test>" && pbx.LastRefer.Get("Referred-By").Length > 0);
+        pbx.RejectReferWith = 403;
+        var rejected = await busy.TransferAsync("sip:51@example.test").WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(rejected is { Outcome: SipTransferOutcome.Failed, StatusCode: 403 } && busy.Status.State == SipCallState.Established);
+        Check.Throws<ArgumentException>(() => busy.TransferAsync("50\r\nX: y").GetAwaiter().GetResult());
+        Check.Throws<ArgumentException>(() => busy.TransferAsync("50@other.test").GetAwaiter().GetResult());
+        await busy.HangupAsync();
+
+        pbx.RejectReferWith = 0; pbx.TransferFinalCode = 200; int byes = pbx.ByeRequests;
+        var call = client.CreateCall("124"); await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        var done = await call.TransferAsync("50").WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(done is { Outcome: SipTransferOutcome.Succeeded, StatusCode: 200 }, done.ToString());
+        await call.Completion.WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(call.Status.EndReason == SipCallEndReason.Transferred && pbx.ByeRequests == byes + 1);
+        await client.DisconnectAsync();
+    }),
+    ("Attended transfer: REFER with Replaces of the consultation dialog, failure keeps both calls", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var caller = client.CreateCall("123"); await caller.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        await caller.HoldAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        var colleague = client.CreateCall("50"); await colleague.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Check.Throws<ArgumentException>(() => caller.TransferToCallAsync(caller).GetAwaiter().GetResult());
+
+        pbx.TransferFinalCode = 486;
+        var failed = await caller.TransferToCallAsync(colleague).WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(failed.Outcome == SipTransferOutcome.Failed && caller.Status.State == SipCallState.Established &&
+            colleague.Status.State == SipCallState.Established && caller.IsOnHold, failed.ToString());
+        string referTo = Uri.UnescapeDataString(pbx.LastRefer!.Get("Refer-To"));
+        string localTag = SipMessage.Parameter(pbx.LastRefer.Get("From"), "tag");
+        Check.That(referTo.StartsWith("<sip:50@example.test?Replaces=" + colleague.Id + ";to-tag=remote-tag;from-tag=", StringComparison.Ordinal) &&
+            !referTo.Contains(localTag), referTo);
+
+        pbx.TransferFinalCode = 200;
+        var done = await caller.TransferToCallAsync(colleague).WaitAsync(TimeSpan.FromSeconds(5));
+        Check.That(done.Outcome == SipTransferOutcome.Succeeded, done.ToString());
+        await Task.WhenAll(caller.Completion, colleague.Completion).WaitAsync(TimeSpan.FromSeconds(3));
+        Check.That(caller.Status.EndReason == SipCallEndReason.Transferred && colleague.Status.EndReason == SipCallEndReason.RemoteHangup);
+        await client.DisconnectAsync();
+    }),
+    ("Party identities: display names, tel URIs, anonymous callers, entry splitting and History-Info order", () =>
+    {
+        var named = SipPartyIdentity.Parse("\"M\\\"ax, Mu\" <sip:%2B49176123@pbx.example;user=phone>;tag=abc")!;
+        Check.That(named.DisplayName == "M\"ax, Mu" && named.Number == "+49176123" && named.Uri == "sip:%2B49176123@pbx.example;user=phone", named.ToString());
+        var plain = SipPartyIdentity.Parse("sip:0363147@pbx.example;tag=x")!;
+        Check.That(plain.Number == "0363147" && plain.DisplayName is null && plain.Uri == "sip:0363147@pbx.example");
+        Check.That(SipPartyIdentity.Parse("<tel:+493631;phone-context=x>")!.Number == "+493631");
+        var anonymous = SipPartyIdentity.Parse("\"Anonymous\" <sip:anonymous@anonymous.invalid>")!;
+        Check.That(anonymous.Anonymous && anonymous.Number is null);
+        Check.That(SipPartyIdentity.Parse("<sip:pbx.example>")!.Number is null && SipPartyIdentity.Parse("") is null);
+        var entries = SipPartyIdentity.SplitEntries("\"A, B\" <sip:1@x>;reason=busy, <sip:2@x;a=b,c>;index=1.1,<tel:3>").ToArray();
+        Check.That(entries.Length == 3 && entries[0].StartsWith("\"A, B\"") && entries[2] == "<tel:3>", string.Join(" | ", entries));
+        Check.That(SipPartyIdentity.HeaderParameter("<sip:2@x;index=9>;index=1.1", "index") == "1.1");
+        Check.That(SipPartyIdentity.CompareIndex(SipPartyIdentity.IndexKey("1.1"), SipPartyIdentity.IndexKey("1")) > 0 &&
+            SipPartyIdentity.CompareIndex(SipPartyIdentity.IndexKey("1.2"), SipPartyIdentity.IndexKey("2")) < 0);
+        return Task.CompletedTask;
+    }),
+    ("Incoming caller identity prefers P-Asserted-Identity and reports the originally dialled number", async () =>
+    {
+        await using var pbx = new TestPbx(); await using var manager = new SipClientManager();
+        var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
+        var calls = new System.Collections.Concurrent.ConcurrentQueue<SipCall>(); client.IncomingCall += (_, c) => calls.Enqueue(c);
+
+        await pbx.InviteAsync("\"Spoofed\" <sip:999@example.test>",
+            ("P-Asserted-Identity", "<tel:+49176123>, \"Max Muster\" <sip:+49176123@example.test>"),
+            ("Diversion", "<sip:43@example.test>;reason=no-answer;counter=1"),
+            ("Diversion", "<sip:0@example.test>;reason=unconditional;counter=1"));
+        await Check.EventuallyAsync(() => calls.Count == 1); calls.TryDequeue(out var forwarded);
+        Check.That(forwarded!.RemoteIdentity.Number == "+49176123" && forwarded.RemoteIdentity.DisplayName is null, forwarded.RemoteIdentity.ToString());
+        Check.That(forwarded.Diversions.Count == 2 && forwarded.Diversions[0].Number == "43" && forwarded.CalledIdentity!.Number == "0");
+        Check.That(forwarded.InitialHeaders.Any(h => h.Key == "Diversion") && !forwarded.InitialHeaders.Any(h => h.Key == "Authorization"));
+        await forwarded.RejectAsync();
+
+        await pbx.InviteAsync("\"Erika\" <sip:0363112@example.test>",
+            ("History-Info", "<sip:47@example.test>;index=1.1, <sip:60@example.test>;index=1"));
+        await Check.EventuallyAsync(() => calls.Count == 1); calls.TryDequeue(out var history);
+        Check.That(history!.RemoteIdentity is { Number: "0363112", DisplayName: "Erika" } && history.CalledIdentity!.Number == "60" && history.Diversions.Count == 0);
+        await history.RejectAsync();
+
+        // A PBX that addresses the endpoint by its own registration does not tell the dialled number.
+        await pbx.InviteAsync("<sip:0363112@example.test>");
+        await Check.EventuallyAsync(() => calls.Count == 1); calls.TryDequeue(out var direct);
+        Check.That(direct!.CalledIdentity is null && direct.RemoteIdentity.Number == "0363112");
+        await direct.RejectAsync();
+
+        // Pattern observed at a real PBX: Remote-Party-ID with party=calling, Diversion carrying the forwarding device.
+        await pbx.InviteAsync("\"Forwarding User\" <sip:0176555@example.test>",
+            ("Remote-Party-ID", "\"Forwarding User\" <sip:0176555@example.test>;party=calling;privacy=off;screen=no"),
+            ("Diversion", "\"Desk / Office\" <sip:62@example.test>;reason=unconditional"));
+        await Check.EventuallyAsync(() => calls.Count == 1); calls.TryDequeue(out var rpid);
+        Check.That(rpid!.RemoteIdentity.Number == "0176555" && rpid.CalledIdentity!.Number == "62" &&
+            rpid.CalledIdentity.DisplayName == "Desk / Office" && rpid.Diversions.Count == 1);
+        await rpid.RejectAsync(); await client.DisconnectAsync();
     })
 };
 int failed = 0;
