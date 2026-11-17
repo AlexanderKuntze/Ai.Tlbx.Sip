@@ -5,8 +5,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <Version>11.11.0</Version>
-    <VoiceAssistantVersion>11.11.0</VoiceAssistantVersion>
+    <Version>11.12.0</Version>
+    <VoiceAssistantVersion>11.12.0</VoiceAssistantVersion>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <Deterministic>true</Deterministic>
     <PackageTags>sip;telephony;rtp;pcm;voice;managed</PackageTags>
