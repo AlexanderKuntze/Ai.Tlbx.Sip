@@ -7,7 +7,13 @@ public enum SipMediaSecurity { Unencrypted, SdesRequired }
 public enum SipClientState { Disconnected, Connecting, Connected, Reconnecting, Failed, Disconnecting }
 public enum SipCallState { Created, Calling, Ringing, Incoming, Answering, Established, Ending, Ended }
 public enum SipCallDirection { Incoming, Outgoing }
-public enum SipCallEndReason { LocalHangup, RemoteHangup, Rejected, Busy, Cancelled, Timeout, ConnectionLost, ProtocolError }
+/// <summary>RFC 3264 media direction, always from the point of view of the side that sent the SDP.</summary>
+public enum SipMediaDirection { SendReceive, SendOnly, ReceiveOnly, Inactive }
+public enum SipCallEndReason { LocalHangup, RemoteHangup, Rejected, Busy, Cancelled, Timeout, ConnectionLost, ProtocolError, Transferred }
+/// <summary>Result of a call transfer. <c>Unknown</c> means the PBX accepted the REFER but no final result was reported before the call ended or the wait timed out.</summary>
+public enum SipTransferOutcome { Succeeded, Failed, Unknown }
+/// <summary>Outcome of <see cref="SipCall.TransferAsync"/> with the SIP status the PBX reported for the REFER or for the transfer target, if any.</summary>
+public sealed record SipTransferResult(SipTransferOutcome Outcome, int? StatusCode, string? ReasonPhrase);
 
 /// <summary>Secrets are never included in ToString or diagnostic events.</summary>
 public sealed class SipCredentials

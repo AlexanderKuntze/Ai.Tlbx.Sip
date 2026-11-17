@@ -41,9 +41,13 @@ public sealed class SipCallAudio : IAsyncDisposable
     private Task[] _tasks = [];
     private long _txPackets, _rxPackets, _txBytes, _rxBytes, _lost, _duplicate, _late, _underruns;
     private long _highestSequence = -1, _playSequence = -1, _samplePosition;
-    private bool _playing, _disposed, _started;
+    private bool _playing, _disposed, _started, _sending = true;
+    private SipMediaDirection _direction = SipMediaDirection.SendReceive;
     private readonly uint _ssrc = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
     private uint? _remoteSsrc;
+    private long _remoteSsrcSeen;
+    /// <summary>A new remote SSRC replaces the current one after the current source was silent this long (RFC 3550 section 8.2).</summary>
+    internal static readonly TimeSpan SourceSwitchSilence = TimeSpan.FromMilliseconds(200);
     private ushort _sequence = (ushort)RandomNumberGenerator.GetInt32(ushort.MaxValue);
     private uint _timestamp = (uint)RandomNumberGenerator.GetInt32(int.MaxValue);
     internal SipCallAudio(SipClientConfig config, TimeProvider time, IPAddress localAddress, Action<string> failure)
@@ -81,6 +85,8 @@ public sealed class SipCallAudio : IAsyncDisposable
             _underruns, _session?.Codec, _control.Metrics); }
     }
     public event EventHandler<SipMediaMetrics>? MetricsChanged;
+    /// <summary>Negotiated direction from this endpoint's point of view. While it does not include sending, written audio is discarded at the real-time pace instead of being transmitted.</summary>
+    public SipMediaDirection Direction { get { lock (_gate) return _direction; } }
     public IAsyncEnumerable<PcmAudioFrame> ReadFramesAsync(CancellationToken cancellationToken = default) => _received.Reader.ReadAllAsync(cancellationToken);
     /// <summary>Copies samples. Returns false without consuming input when the bounded transmit queue is full.</summary>
     public bool TryWrite(ReadOnlySpan<short> samples, int sampleRate)
@@ -128,12 +134,13 @@ public sealed class SipCallAudio : IAsyncDisposable
         }
         return true;
     }
-    internal void Start(SdpSession session)
+    internal void Start(SdpSession session, SipMediaDirection direction = SipMediaDirection.SendReceive)
     {
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_started) throw new InvalidOperationException("Call media already started.");
+            _direction = direction; _sending = direction is SipMediaDirection.SendReceive or SipMediaDirection.SendOnly;
             _session = session; _remote = new(session.Address, session.Port);
             _remoteControl = new(session.RtcpAddress, session.RtcpPort);
             _codec = new(session.Codec); _rxResampler = new(session.SampleRate, _config.AudioSampleRate);
@@ -150,6 +157,35 @@ public sealed class SipCallAudio : IAsyncDisposable
             _started = true;
             _tasks = [GuardAsync(ReceiveAsync), GuardAsync(SendAsync), GuardAsync(PlayoutAsync), GuardAsync(MetricsAsync),
                 GuardAsync(ReceiveControlAsync), GuardAsync(SendControlAsync)];
+        }
+    }
+    /// <summary>
+    /// Applies a renegotiated session (re-INVITE or UPDATE, RFC 3264 section 8): new remote address,
+    /// codec, SRTP key or direction. The PBX may switch the media source when it holds, parks or
+    /// transfers a call, so receive state restarts and a new remote SSRC is accepted.
+    /// </summary>
+    internal void Update(SdpSession session, SipMediaDirection direction)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_started) throw new InvalidOperationException("Call media has not started.");
+            var previous = _session!;
+            if (session.Codec != previous.Codec)
+            {
+                _codec = new(session.Codec); _rxResampler = new(session.SampleRate, _config.AudioSampleRate);
+                _txResampler = null; _txInputRate = 0; _outbound.Clear();
+            }
+            if (session.Secure && (previous.MasterKey is null || !session.MasterKey!.AsSpan().SequenceEqual(previous.MasterKey)))
+            {
+                _rxCrypto?.Dispose(); _rxControlCrypto?.Dispose();
+                _rxCrypto = new(session.MasterKey!); _rxControlCrypto = new(session.MasterKey!);
+                if (previous.MasterKey is not null) CryptographicOperations.ZeroMemory(previous.MasterKey);
+            }
+            _session = session; _remote = new(session.Address, session.Port);
+            _remoteControl = new(session.RtcpAddress, session.RtcpPort);
+            _remoteSsrc = null; _jitter.Clear(); _decoded.Clear(); _highestSequence = -1; _playSequence = -1; _playing = false;
+            _direction = direction; _sending = direction is SipMediaDirection.SendReceive or SipMediaDirection.SendOnly;
         }
     }
     private async Task GuardAsync(Func<CancellationToken, Task> action)
@@ -172,6 +208,7 @@ public sealed class SipCallAudio : IAsyncDisposable
                 if (_outbound.Count < count) _underruns++;
                 var samples = new short[count];
                 for (int i = 0; i < count; i++) samples[i] = _outbound.Count > 0 ? _outbound.Dequeue() : (short)0;
+                if (!_sending) { _timestamp += 160; continue; }
                 var encoded = _codec!.Encode(samples);
                 packet = new byte[12 + encoded.Length]; encoded.CopyTo(packet, 12);
             }
@@ -218,8 +255,16 @@ public sealed class SipCallAudio : IAsyncDisposable
                     packet = plaintext;
                 }
                 uint ssrc = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(8));
-                if (_remoteSsrc.HasValue && _remoteSsrc != ssrc) continue;
-                _remoteSsrc = ssrc;
+                if (_remoteSsrc.HasValue && _remoteSsrc != ssrc)
+                {
+                    // PBXs restart the media stream with a new SSRC and sequence after hold, resume or a
+                    // transfer, often without any signalling to this leg. Follow the new source once the
+                    // old one has stopped; interleaved sources keep the current one.
+                    if (_time.GetElapsedTime(_remoteSsrcSeen) < SourceSwitchSilence) continue;
+                    _failure($"Remote media source changed (SSRC {_remoteSsrc:X8} -> {ssrc:X8}).");
+                    _jitter.Clear(); _decoded.Clear(); _highestSequence = -1; _playSequence = -1; _playing = false;
+                }
+                _remoteSsrc = ssrc; _remoteSsrcSeen = _time.GetTimestamp();
                 if (_config.AllowSymmetricRtp) _remote = datagram.RemoteEndPoint;
                 int end = packet.Length;
                 if ((packet[0] & 32) != 0)

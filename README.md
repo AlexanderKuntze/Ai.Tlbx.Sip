@@ -102,6 +102,53 @@ await incomingCall.AnswerAsync();
 
 Observe `call.Completion` to wait for final teardown. A retained call object keeps its final status after it has been removed from the client's active collection. Disconnecting a client ends its calls.
 
+### Hold, resume and session refresh
+
+```csharp
+call.MediaChanged += (_, remote) => Console.WriteLine($"Remote direction: {remote}");
+
+await call.HoldAsync();   // re-INVITE offering sendonly; hold music may still be written to call.Audio
+await call.ResumeAsync(); // re-INVITE offering sendrecv
+```
+
+In-dialog re-INVITE (RFC 3261 section 14.2) and UPDATE (RFC 3311) from the PBX are accepted and answered with the RFC 3264 complementary direction (`sendrecv`, `sendonly`, `recvonly`, `inactive`, including the legacy `0.0.0.0` hold). `call.RemoteMediaDirection` reports what the remote side declared, `call.Audio.Direction` the negotiated local direction; no RTP is sent while the local direction does not include sending. A rejected own re-INVITE leaves the session unchanged and throws `SipException`; `491` is retried after a random delay, and `408`/`481` end the dialog with BYE.
+
+Some PBXs hold and resume without any signalling to this leg and only switch the RTP source. The receiver follows a new remote SSRC once the current one has been silent for 200 ms and reports the switch as a `media` diagnostic. SRTP receive state is kept per SSRC (RFC 3711 section 3.2.3). Replay windows are retained for the key lifetime, with at most 256 remote SSRCs per key; further unknown streams are rejected until a new key is negotiated. Existing streams keep working at the limit.
+
+### Caller identity
+
+```csharp
+client.IncomingCall += (_, call) =>
+{
+    string? caller = call.RemoteIdentity.Number;     // P-Asserted-Identity, else Remote-Party-ID, else From
+    string? dialled = call.CalledIdentity?.Number;   // oldest Diversion, else History-Info, else To; null if unknown
+    bool forwarded = call.Diversions.Count > 0;      // forwarding chain, most recent first
+};
+```
+
+`SipPartyIdentity` carries the URI, the number (user part of a `sip:` URI or a `tel:` number), the display name and whether the party is anonymous (RFC 3323). The asserted identity is preferred because the `From` header can be set by the caller. `CalledIdentity` is null when the PBX only addresses this endpoint by its own registration and does not tell the dialled number. `InitialHeaders` exposes all headers of the initial INVITE (without authorization headers) for PBX-specific information. See `docs/changes/caller-identity.md`.
+
+### Transfer
+
+```csharp
+// Blind transfer to an extension, number or sip: URI.
+var result = await call.TransferAsync("50");
+
+// Attended transfer: hold the caller, consult the colleague, then join both.
+await call.HoldAsync();
+var consultation = client.CreateCall("50");
+await consultation.StartAsync();
+// ... announce the caller over consultation.Audio ...
+var joined = await call.TransferToCallAsync(consultation);
+if (joined.Outcome != SipTransferOutcome.Succeeded)
+{
+    await consultation.HangupAsync();
+    await call.ResumeAsync();
+}
+```
+
+Both send REFER (RFC 3515); attended transfer adds a `Replaces` header for the consultation dialog (RFC 3891, RFC 5589 section 7). The result reports the native SIP status from the REFER response or the final `message/sipfrag` NOTIFY. On success this side sends BYE and the call ends as `Transferred`; on failure the calls stay as they are and the application decides how to continue. Transfer NOTIFY subscriptions are matched by the REFER CSeq in `Event: refer;id=...` (RFC 3515 section 2.4.6), including authentication retries. An omitted ID is accepted only for the first transfer in a dialog; ambiguous later notifications cannot complete a new transfer. See `docs/changes/transfer-refer.md`.
+
 Concurrent `HangupAsync` callers share teardown. Cancelling a hangup wait does not abandon the call's protocol cleanup. If an incoming answer never receives ACK, the transaction timeout ends the call and releases hangup waiters.
 
 ## Exchange PCM audio
@@ -157,7 +204,7 @@ Transport = SipTransportProtocol.Tls,
 MediaSecurity = SipMediaSecurity.SdesRequired
 ```
 
-Currently unsupported: DTLS-SRTP, RTCP multiplexing, Opus, DNS NAPTR/SRV discovery, ICE/STUN/TURN, session timers, reliable provisional responses/PRACK, hold/re-INVITE, transfers, and forked-dialog handling. The endpoint targets direct PBX registration rather than implementing a SIP proxy or registrar. Plain RTP/SDES support does not imply WebRTC compatibility.
+Currently unsupported: DTLS-SRTP, RTCP multiplexing, Opus, DNS NAPTR/SRV discovery, ICE/STUN/TURN, session timers, reliable provisional responses/PRACK, incoming REFER and INVITE with Replaces, DTMF, and forked-dialog handling. The endpoint targets direct PBX registration rather than implementing a SIP proxy or registrar. Plain RTP/SDES support does not imply WebRTC compatibility.
 
 ## Try the console
 
@@ -173,13 +220,13 @@ dotnet run --project samples/SipConsole -f net10.0
 
 Commands: `list`, `call <number>`, `answer <call-id>`, `hangup <call-id>`, `quit`.
 
-Optional flags: `--probe` registers then disconnects; `--echo` echoes received audio; `--auto-answer` explicitly enables answering incoming calls; `--listen-seconds 300` listens for a bounded interval without console input; `--dial <destination>` explicitly starts an outgoing call after registration; `--srtp` requires SDES-SRTP. Set `SIP_TRANSPORT=Tls` for TLS. Outgoing calls require an explicit `call` command or `--dial` argument.
+Optional flags: `--probe` registers then disconnects; `--echo` echoes received audio; `--auto-answer` explicitly enables answering incoming calls; `--listen-seconds 300` listens for a bounded interval without console input; `--dial <destination>` explicitly starts an outgoing call after registration; `--srtp` requires SDES-SRTP; `--hold-test` holds each call five seconds after establishment, plays a 440 Hz tone for six seconds and resumes; `--transfer-test <target>` blind-transfers each call after five seconds; `--attended-test <target>` holds an incoming caller, consults the target, announces with a tone and joins both, or takes the caller back if the target does not answer within 20 seconds; `--show-identity` prints caller number, display name, dialled number, forwarding chain and all initial headers of incoming calls. Set `SIP_TRANSPORT=Tls` for TLS. Outgoing calls require an explicit `call` command or `--dial` argument.
 
 Alternatively, pass `--config /path/to/client.secrets.json`. It accepts the `SipClientConfig` JSON properties, with enum names such as `"Transport": "Udp"`. Keep credential files outside the checkout. Never commit real configuration or credentials.
 
 FRITZ!Box: create an IP telephone in the router's telephony settings and use its dedicated credentials. Start on the same LAN. See [FRITZ!Box setup](https://fritz.com/apps/knowledge-base/FRITZ-Box-4050/42_ip-telefon-an-fritz-box-anmelden-und-einrichten).
 
-easybell Cloud PBX is an intended interoperability target, using its endpoint credentials rather than SIP-trunk credentials. easybell documents `pbx.easybell.de` and TLS on port 5061, with SRTP for encrypted media. DNS-SRV discovery and real-provider acceptance remain open. See [easybell endpoint/security settings](https://www.easybell.de/hilfe/ergebnis/voip-experteneinstellungen/).
+easybell Cloud PBX is an intended interoperability target, using its endpoint credentials rather than SIP-trunk credentials. easybell documents `pbx.easybell.de` and TLS on port 5061, with SRTP for encrypted media. Real-provider acceptance at an easybell Cloud PBX extension over TLS 5061 with SDES-SRTP covers registration, incoming and outgoing calls with G.722, caller number, two concurrent calls, a 35-minute call, remote hold/resume (RTP source switch without signalling), local hold/resume by re-INVITE, blind transfer and attended transfer with Replaces, and caller identity from `Remote-Party-ID` and `Diversion`; see `docs/changes/`. DNS-SRV discovery remains open. See [easybell endpoint/security settings](https://www.easybell.de/hilfe/ergebnis/voip-experteneinstellungen/).
 
 ## Build and verify
 
@@ -191,7 +238,7 @@ dotnet pack src/Ai.Tlbx.Sip -c Release -o artifacts
 dotnet pack src/Ai.Tlbx.VoiceAssistant.Sip -c Release -o artifacts
 ```
 
-The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, registration expiry/recovery, refresh/disconnect ordering, call setup/teardown, cancellation/acceptance races, late final responses, duplicate INVITEs, invalid destinations, progress-only timeouts and their final ACKs, early-media backlog, silence suppression, PCM flow, G.722, minimum-size transmit buffers and the VoiceAssistant adapter. TLS tests exchange SIP over real encrypted loopback connections and verify rejection of unknown certificate authorities and wrong hostnames, using an ephemeral test CA without changing machine trust stores. Builds and tests run on Windows and Debian Linux without PBX credentials or paid AI calls. The VoiceAssistant demo's additional local-peer tests verify complete ordered RTP sections for an AI burst longer than the SIP transmit buffer.
+The test runner requires no test framework and returns a nonzero exit code on failure. It covers framing, parser rejection, G.711 values, resampling continuity and anti-aliasing, RFC 3711 key-derivation vectors, SRTP tamper/replay rejection and rollover, registration/authentication, UDP retransmission, TCP stream fragmentation, contact selection, registration expiry/recovery, refresh/disconnect ordering, call setup/teardown, cancellation/acceptance races, late final responses, duplicate INVITEs, SDP media directions, remote and local hold/resume by re-INVITE and UPDATE, 491 glare retry, remote SSRC switching with per-SSRC SRTP state, blind and attended transfer by REFER with sipfrag NOTIFY results, caller identity from P-Asserted-Identity/Remote-Party-ID/From and dialled number from Diversion/History-Info, invalid destinations, progress-only timeouts and their final ACKs, early-media backlog, silence suppression, PCM flow, G.722, minimum-size transmit buffers and the VoiceAssistant adapter. TLS tests exchange SIP over real encrypted loopback connections and verify rejection of unknown certificate authorities and wrong hostnames, using an ephemeral test CA without changing machine trust stores. Builds and tests run on Windows and Debian Linux without PBX credentials or paid AI calls. The VoiceAssistant demo's additional local-peer tests verify complete ordered RTP sections for an AI burst longer than the SIP transmit buffer.
 
 Run `pwsh ./verify-release.ps1` for the release gate: build, protocol/media checks on both target frameworks, both packages including both assemblies/dependency groups, identity/license checks, and a fresh-cache consumer for each target outside the repository without project references. Packages and SHA-256 verification metadata are written under `artifacts/release/<version>/`. GitHub `verify.yml` runs this gate on Windows and Linux.
 
