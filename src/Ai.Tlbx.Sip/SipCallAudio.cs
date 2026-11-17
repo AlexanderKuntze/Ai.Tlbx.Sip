@@ -42,6 +42,7 @@ public sealed class SipCallAudio : IAsyncDisposable
     private long _txPackets, _rxPackets, _txBytes, _rxBytes, _lost, _duplicate, _late, _underruns;
     private long _highestSequence = -1, _playSequence = -1, _samplePosition;
     private bool _playing, _disposed, _started, _sending = true;
+    private int _inFlightSamples;
     private SipMediaDirection _direction = SipMediaDirection.SendReceive;
     private readonly uint _ssrc = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
     private uint? _remoteSsrc;
@@ -77,11 +78,11 @@ public sealed class SipCallAudio : IAsyncDisposable
     internal byte[]? MasterKey => _masterKey;
     public int SampleRate => _config.AudioSampleRate;
     private int CodecSampleRate => _codec?.SampleRate ?? 8000;
-    public TimeSpan QueuedAudio { get { lock (_gate) return TimeSpan.FromSeconds((double)_outbound.Count / CodecSampleRate); } }
+    public TimeSpan QueuedAudio { get { lock (_gate) return TimeSpan.FromSeconds((double)(_outbound.Count + _inFlightSamples) / CodecSampleRate); } }
     public SipMediaMetrics Metrics
     {
         get { lock (_gate) return new(_txPackets, _rxPackets, _txBytes, _rxBytes, _lost, _duplicate, _late,
-            _control.JitterSamples / 8.0, _control.RoundTripMilliseconds, TimeSpan.FromSeconds((double)_outbound.Count / CodecSampleRate),
+            _control.JitterSamples / 8.0, _control.RoundTripMilliseconds, TimeSpan.FromSeconds((double)(_outbound.Count + _inFlightSamples) / CodecSampleRate),
             _underruns, _session?.Codec, _control.Metrics); }
     }
     public event EventHandler<SipMediaMetrics>? MetricsChanged;
@@ -206,23 +207,29 @@ public sealed class SipCallAudio : IAsyncDisposable
             {
                 int count = CodecSampleRate / 50;
                 if (_outbound.Count < count) _underruns++;
+                int queuedSamples = Math.Min(_outbound.Count, count);
                 var samples = new short[count];
                 for (int i = 0; i < count; i++) samples[i] = _outbound.Count > 0 ? _outbound.Dequeue() : (short)0;
                 if (!_sending) { _timestamp += 160; continue; }
                 var encoded = _codec!.Encode(samples);
                 packet = new byte[12 + encoded.Length]; encoded.CopyTo(packet, 12);
+                _inFlightSamples = queuedSamples;
             }
-            packet[0] = 0x80; packet[1] = (byte)_session!.PayloadType;
-            int payloadOctets = packet.Length - 12; uint sentTimestamp = _timestamp;
-            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), _sequence++);
-            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4), _timestamp); _timestamp += 160;
-            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(8), _ssrc);
-            lock (_gate)
+            try
             {
-                if (_txCrypto is not null) packet = _txCrypto.Protect(packet, 12);
+                packet[0] = 0x80; packet[1] = (byte)_session!.PayloadType;
+                int payloadOctets = packet.Length - 12; uint sentTimestamp = _timestamp;
+                BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), _sequence++);
+                BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4), _timestamp); _timestamp += 160;
+                BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(8), _ssrc);
+                lock (_gate)
+                {
+                    if (_txCrypto is not null) packet = _txCrypto.Protect(packet, 12);
+                }
+                await _rtp.SendAsync(packet, _remote!, cancellationToken);
+                lock (_gate) { _txPackets++; _txBytes += packet.Length; _control.RecordSent(sentTimestamp, payloadOctets); }
             }
-            await _rtp.SendAsync(packet, _remote!, cancellationToken);
-            lock (_gate) { _txPackets++; _txBytes += packet.Length; _control.RecordSent(sentTimestamp, payloadOctets); }
+            finally { lock (_gate) _inFlightSamples = 0; }
         }
     }
     internal static int RtpHeaderLength(ReadOnlySpan<byte> packet)
