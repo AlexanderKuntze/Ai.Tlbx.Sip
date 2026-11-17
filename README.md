@@ -4,7 +4,7 @@ Managed SIP clients with observable connection state, call objects, and bidirect
 
 The SIP library handles telephony. Applications decide whether to connect a call to an audio device, a recorder, or an AI voice assistant. Multiple independently authenticated SIP identities can run in the same process.
 
-Version 11.12.0 provides direct PBX registration, incoming/outgoing calls and managed PCM media with explicit lifetime, cancellation and error handling. Protocol/media checks run on Windows and Linux. Real FRITZ!Box acceptance covers registration, incoming/outgoing echo calls, remote hangup and clean unregistration. The VoiceAssistant Web demo has also been tested over a real phone call: long AI answers play completely, and speaking over the agent interrupts playback and changes the conversation topic. See the supported transports and interoperability limits below.
+Version 11.13.0 provides direct PBX registration, incoming/outgoing calls and managed PCM media with explicit lifetime, cancellation and error handling. Protocol/media checks run on Windows and Linux. Real FRITZ!Box acceptance covers registration, incoming/outgoing echo calls, remote hangup and clean unregistration. The VoiceAssistant Web demo has also been tested over a real phone call: long AI answers play completely, and speaking over the agent interrupts playback and changes the conversation topic. See the supported transports and interoperability limits below.
 
 Encrypted RTP/RTCP is verified with local peers and independent numeric reference vectors; encrypted interoperability with a real provider remains unverified. Earlier echo acceptance included clear continuous G.722 audio and roughly one second perceived echo delay; this is not a measured one-way or AI response latency.
 
@@ -21,12 +21,12 @@ Both packages target .NET 10 and .NET 11 (`net10.0;net11.0`). Build from source 
 ## Install
 
 ```sh
-dotnet add package Ai.Tlbx.Sip --version 11.12.0
+dotnet add package Ai.Tlbx.Sip --version 11.13.0
 # Optional AI audio adapter (also installs the SIP core):
-dotnet add package Ai.Tlbx.VoiceAssistant.Sip --version 11.12.0
+dotnet add package Ai.Tlbx.VoiceAssistant.Sip --version 11.13.0
 ```
 
-The SIP core, adapter and VoiceAssistant toolkit share version `11.12.0`. `Version` and `VoiceAssistantVersion` in `Directory.Build.props` must match; the latter controls both the adapter package version and its VoiceAssistant dependency. Both packages contain `net10.0` and `net11.0` assemblies.
+The SIP core, adapter and VoiceAssistant toolkit share version `11.13.0`. `Version` and `VoiceAssistantVersion` in `Directory.Build.props` must match; the latter controls both the adapter package version and its VoiceAssistant dependency. Both packages contain `net10.0` and `net11.0` assemblies.
 
 ## Create and connect a client
 
