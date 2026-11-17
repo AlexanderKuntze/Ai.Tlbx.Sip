@@ -36,6 +36,8 @@ internal sealed class TestPbx : IAsyncDisposable
     public int? GrantedExpirySeconds { get; init; }
     public volatile bool DropRegistrationResponses;
     public int AckRequests { get; private set; }
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string CallId, int Sequence), byte> _acknowledged = new();
+    public bool HasAcknowledged(SipMessage request) => _acknowledged.ContainsKey((request.Get("Call-ID"), request.CSeqNumber));
     public SipMessage? LastRefer { get; private set; }
     public bool InjectStaleReferNotify { get; set; }
     public bool OmitReferEventId { get; set; }
@@ -83,7 +85,7 @@ internal sealed class TestPbx : IAsyncDisposable
                 var data = await _sip.ReceiveAsync(_stop.Token); _client = data.RemoteEndPoint;
                 var request = SipMessage.Parse(data.Buffer);
                 if (request.IsResponse) { _responses.Writer.TryWrite(request); continue; }
-                if (request.Method == "ACK") { AckRequests++; continue; }
+                if (request.Method == "ACK") { AckRequests++; _acknowledged.TryAdd((request.Get("Call-ID"), request.CSeqNumber), 0); continue; }
                 if (request.Method == "REGISTER")
                 {
                     RegisterRequests++; if (DropFirstRegister && RegisterRequests == 1) continue;

@@ -574,18 +574,17 @@ var cases = new (string Name, Func<Task> Run)[]
         var client = manager.CreateClient(Check.Config(pbx.Port)); await client.ConnectAsync();
         var call = client.CreateCall("123");
         await call.StartAsync().WaitAsync(TimeSpan.FromSeconds(5));
-        int acks = pbx.AckRequests;
-
         await call.HoldAsync().WaitAsync(TimeSpan.FromSeconds(3));
-        string offer = Encoding.UTF8.GetString(pbx.LastReinvite!.Body);
-        Check.That(offer.Contains("a=sendonly\r\n") && pbx.LastReinvite.Get("CSeq").EndsWith("INVITE"), offer);
+        var heldInvite = pbx.LastReinvite!;
+        string offer = Encoding.UTF8.GetString(heldInvite.Body);
+        Check.That(offer.Contains("a=sendonly\r\n") && heldInvite.Get("CSeq").EndsWith("INVITE"), offer);
         Check.That(call.IsOnHold && call.Audio.Direction == SipMediaDirection.SendOnly && call.RemoteMediaDirection == SipMediaDirection.ReceiveOnly);
-        await Check.EventuallyAsync(() => pbx.AckRequests == acks + 1);
+        await Check.EventuallyAsync(() => pbx.HasAcknowledged(heldInvite));
         // While holding, this side may still play hold music: transmission continues.
         long sent = call.Metrics.TransmittedPackets; await Check.EventuallyAsync(() => call.Metrics.TransmittedPackets > sent + 2);
 
         await call.ResumeAsync().WaitAsync(TimeSpan.FromSeconds(3));
-        Check.That(Encoding.UTF8.GetString(pbx.LastReinvite.Body).Contains("a=sendrecv\r\n"));
+        Check.That(Encoding.UTF8.GetString(pbx.LastReinvite!.Body).Contains("a=sendrecv\r\n"));
         Check.That(!call.IsOnHold && call.Audio.Direction == SipMediaDirection.SendReceive);
 
         pbx.RejectReinvites.Enqueue(488);
